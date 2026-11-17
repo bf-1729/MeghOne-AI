@@ -1,0 +1,10 @@
+# Dev / CI tooling - pinned so every developer and the pipeline use the same versions.
+# App runtime dependencies go in requirements.txt.
+ruff==0.17.5
+pytest==9.2.0
+pytest-cov==7.1.0
+pytest-playwright==0.10.0
+playwright==1.65.2   # keep in sync with the Playwright image tag in bitbucket-pipelines.yml
+bandit==1.9.4
+pip-audit==2.10.1
+pre-commit==4.7.0
