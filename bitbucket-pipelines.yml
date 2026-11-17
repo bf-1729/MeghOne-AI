@@ -1,0 +1,54 @@
+# Bitbucket Pipelines - Python (Django / FastAPI)
+# Build + lint + test only. No deployment yet.
+
+image: python:3.12-slim
+
+definitions:
+  caches:
+    pip-cache: ~/.cache/pip
+
+  steps:
+    - step: &lint
+        name: Lint (ruff)
+        caches:
+          - pip-cache
+        script:
+          - pip install --upgrade pip ruff
+          - ruff check . --output-format=full
+          - ruff format --check .
+
+    - step: &test
+        name: Install & Test (pytest)
+        caches:
+          - pip-cache
+        script:
+          - pip install --upgrade pip
+          - if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          - if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          - pip install pytest pytest-cov
+          - mkdir -p test-results
+          # Exit code 5 = "no tests collected" -> treat as success until tests exist.
+          - pytest --junitxml=test-results/junit.xml --cov=. --cov-report=term || [ $? -eq 5 ]
+        artifacts:
+          - test-results/**
+
+pipelines:
+  # Every branch push
+  default:
+    - parallel:
+        - step: *lint
+        - step: *test
+
+  # Every pull request
+  pull-requests:
+    '**':
+      - parallel:
+          - step: *lint
+          - step: *test
+
+  # main branch
+  branches:
+    main:
+      - parallel:
+          - step: *lint
+          - step: *test
