@@ -66,3 +66,6 @@ test-results/
 .ci_base_url
 .ci_app_pid
 app.log
+
+# Saved login tokens from UI test runs (a real JWT was committed once; gitleaks, 2026-11-18).
+tests/ui_headless/token*.txt
