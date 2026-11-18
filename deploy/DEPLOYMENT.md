@@ -185,17 +185,17 @@ own directory and the two run in parallel; you switch over only when ready.
 | App port (bare metal) | 8300 | **8410** |
 | nginx vhost file | `nginx-nlpservice.conf` | **`nginx-megh-langgraph.conf`** |
 | nginx rate-limit zones | `api_rl`, `login_rl`, `conn_per_ip` | **`*_lg`** (must be unique per file) |
-| compose project | default (`meghalaya`) | **`megh-langgraph`** (`name:` in compose) |
-| Image | `megh-nlp:latest` | **`megh-langgraph:latest`** |
-| Containers | `megh-nlp`, `megh-qdrant`, `megh-redis` | **`megh-langgraph-nlp`, `-qdrant`, `-redis`** |
+| compose project | default (`meghalaya`) | **`meg-6schemes`** (`name:` in compose; renamed from `megh-langgraph` 2026-11-18 — Docker requires lowercase) |
+| Image | `megh-nlp:latest` | **`meg-6schemes:latest`** |
+| Containers | `megh-nlp`, `megh-qdrant`, `megh-redis` | **`Meg-6Schemes-nlp`, `-qdrant`, `-redis`** |
 | Container port / host port | 8300 / 8401 | **8400 / 8411** |
 | Local Qdrant / Redis host ports | 6333 / 6379 | **6343 / 6389** |
-| Named volumes | `meghalaya_hf_cache`, `meghalaya_qdrant_data` | **`megh-langgraph_hf_cache`, `megh-langgraph_qdrant_data`** |
+| Named volumes | `meghalaya_hf_cache`, `meghalaya_qdrant_data` | **`meg-6schemes_hf_cache`, `meg-6schemes_qdrant_data`** |
 
 **Why each one matters.** Docker identifies containers, images, networks and
 volumes *by name*: re-using a name makes `docker compose up` adopt and replace
 the running stack instead of starting a second one. Volume names are prefixed
-with the compose project, so `name: megh-langgraph` separates the data too.
+with the compose project, so `name: meg-6schemes` separates the data too.
 systemd keys services by unit filename. Two processes cannot bind one port, and
 nginx refuses to start if two enabled vhosts declare the same `limit_req_zone`
 name or both claim `default_server`.
