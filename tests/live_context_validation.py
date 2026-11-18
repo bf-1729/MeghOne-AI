@@ -1,0 +1,746 @@
+"""
+LIVE multi-turn context validation against the real model gateway and megh_db.
+
+Not collected by pytest (not named test_*.py). The offline counterparts are
+tests/test_context_semantic_state.py and tests/test_context_hardening.py.
+Needs the office VPN: the gateway and the DB are on 10.48.242.4 (Qdrant is on 115.124.102.167:6335).
+
+    .venv/Scripts/python.exe tests/live_context_validation.py
+    .venv/Scripts/python.exe tests/live_context_validation.py --legacy       # pre-2026-09-26 rewrite, for A/B
+    .venv/Scripts/python.exe tests/live_context_validation.py --only A,E --no-db-sync
+    .venv/Scripts/python.exe tests/live_context_validation.py --out logs/live_ctx.json   (default: a dated file in logs/)
+
+What it does, per scenario (A-G of the 2026-09-26 hardening brief):
+  * runs every turn through pipeline.answer_question in-process, with the
+    router's own helpers (routers.query.is_cacheable / remember_pause /
+    build_turn), so the logic is the product's, not a copy;
+  * unless --no-db-sync, rotates the turns across THREE simulated workers
+    (independent SessionStores) that share state only through the real
+    Postgres snapshot (session_sync with PostgresBackend). That is the KI-028
+    path end to end. Its rows are written under session ids 'live-ctx-...' in
+    app.conversations and deleted at the end;
+  * answers an UNEXPECTED clarification the way a user would click it: the
+    option labelled all / combined / overall, else the first one (TESTING.md);
+  * records, per turn: the rewritten question, the resolved entities, the SQL,
+    the row count, the answer, the structured state and its provenance, the
+    merge plan and follow-up kind, the context tiers the rewrite received, and
+    every model call (role, gateway prompt/completion tokens, latency);
+  * checks the expected behaviour and prints PASS/FAIL per check, plus
+    per-role token and latency figures (p50/p95).
+
+Time to first token: generation is not streamed in this app, so TTFT is not
+observable separately and is reported as equal to the call latency.
+
+Exit code: 0 all checks passed, 1 a check failed, 3 not run (gateway or DB
+unreachable).
+"""
+import argparse
+import asyncio
+import json
+import logging
+import socket
+import statistics
+import sys
+import time
+import uuid
+from pathlib import Path
+from urllib.parse import urlparse
+
+from sqlglot import exp
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app import (context_policy, conversation_layer, conversation_replies, llm, pipeline,  # noqa: E402
+                 session_sync, sql_ast)
+from app.config import settings  # noqa: E402
+from app.pipeline import ClarificationNeeded  # noqa: E402
+from app.routers import query as router  # noqa: E402
+from app.session_store import SessionStore  # noqa: E402
+from app.text_match import words  # noqa: E402
+
+# Focus Plus holds FY 2022-23 and FY 2025-26 only (scheme years loaded from megh_db,
+# 2026-09-26). The first live run asked about FY 2024-25, which correctly paused as
+# out of range, and every scenario built on it was testing the wrong thing.
+Q_FP = "How much was disbursed under Focus Plus in West Garo Hills in FY 2025-26?"
+Q_MG = "How many person-days were generated under MGNREGA in West Garo Hills in FY 2024-25?"
+Q_EKH = "How many person-days were generated under MGNREGA in East Khasi Hills in FY 2022-23?"
+ANSWER_G = ("Across Focus Plus, MGNREGA and PMAY-G, East Khasi Hills, Ri Bhoi and Jaintia Hills "
+            "led; blocks Rongram, Tura and Selsella were next; villages Nongthymmai, Maska and "
+            "Adugre reported most; FY 2019-20 and FY 2021-22 were the peak years; women were 54% "
+            "and SC/ST 30%; Piggery and Poultry applicants dominated; person-days reached 1.2 "
+            "lakh for 4,500 beneficiaries.")
+CONTAMINANTS = ["east khasi", "ri bhoi", "jaintia", "rongram", "tura", "selsella", "nongthymmai",
+                "maska", "adugre", "2019", "2021", "women", "female", "piggery", "poultry",
+                "mgnrega", "pmay", "person-days", "person_days"]
+
+SCENARIOS = {
+    "A": ("Geography continuation",
+          [Q_FP, "What about Dalu block?", "How many beneficiaries were there?"]),
+    "B": ("Time continuation (Focus Plus: previous year is not held)", [Q_FP, "What about last year?"]),
+    "B2": ("Time continuation (MGNREGA: previous year is held)", [Q_MG, "What about last year?"]),
+    "C": ("Aggregation continuation",
+          ["How much was disbursed under Focus Plus in West Garo Hills?", "Show it by district."]),
+    "D": ("Result reference",
+          ["Show the districts with beneficiaries under Focus Plus.", "Which one had the highest?",
+           "How much was it?"]),
+    "E": ("Clarification resume", ["Show beneficiaries.", "Focus Plus"]),
+    "F": ("Scheme switching",
+          [Q_FP,
+           "How many person-days were generated under MGNREGA in West Garo Hills in FY 2024-25?",
+           "What about Dalu block?", "What about Focus Legacy?",
+           # No FY: a financial-year word pins a bare "CM Elevate" to CM Elevate
+           # Legacy by design (D-009), which is not what this step tests.
+           "How many applications were received under CM Elevate?"]),
+    "G": ("Contamination", [Q_FP, "What about Dalu block?", "How many beneficiaries were there?"]),
+    # ── open follow-up issues, 2026-10-16 (KNOWN_ISSUES KI-033 / KI-223 / KI-301 and
+    # the forward plan WI-1..WI-4 in documents/Context_Memory_Forward_Backward_Review_v3) ──
+    "H": ("KI-033: a knowledge digression keeps the data scope",
+          ["How many PMAY-G houses were completed in South Garo Hills in FY 2022-23?",
+           "Who is eligible for PMAY-G?", "And in West Garo Hills?"]),
+    "I": ("KI-223: a scheme switch typed while a pause waits",
+          ["How many PMAY-G beneficiaries are there?", "What about MGNREGA?"]),
+    "J": ("KI-301: a pronoun in a question that names a scheme",
+          ["What is Gram Panchayat?", "what is its role in PMAY-G?"]),
+    "K": ("Topic switch after a knowledge answer (WI-1 + WI-2)",
+          ["How many person-days were generated under MGNREGA in East Khasi Hills in FY 2022-23?",
+           "Who is eligible for PMAY-G?", "How many in 2023-24?"]),
+    "L": ("A standalone data question clears the old metric and comparison (WI-3)",
+          ["Compare MGNREGA person-days between East Khasi Hills and Ri Bhoi in FY 2023-24",
+           "How many PMAY-G houses were completed in West Garo Hills in FY 2023-24?",
+           "What about Ri Bhoi?"]),
+    "M": ("'this year' in a standalone question is not the session's old year (WI-4)",
+          ["How many person-days were generated under MGNREGA in West Garo Hills in FY 2022-23?",
+           "How many PMAY-G houses were sanctioned in Ri Bhoi this year?"]),
+    # ── Context Memory proposal (documents/MAIN_Contex.pdf, 2026-10-16): out of
+    # context in the middle (§9.2) and going back to an earlier QUESTION
+    # through the topic ledger (§9.3, Phase 3, built 2026-10-18) ──
+    "N": ("Out of context in the middle keeps the topic (§9.2)",
+          [Q_MG, "Who won the cricket match yesterday?", "What about FY 2023-24?"]),
+    "O": ("Back to an earlier question by content (§9.3, Figure 4)",
+          [Q_EKH, "Who is eligible for PMAY-G?",
+           "How many job cards were issued under MGNREGA in West Garo Hills in FY 2023-24?",
+           "How many PMAY-G houses were completed?", "Go back to the East Khasi Hills one"]),
+    "P": ("Back to the first question, with a new year",
+          [Q_EKH, "How many PMAY-G houses were completed in Ri Bhoi in FY 2023-24?",
+           "Go back to the first question, what about FY 2023-24?"]),
+    "Q": ("'What did we discuss?' lists the questions and keeps the topic",
+          [Q_EKH, "How many PMAY-G houses were completed in Ri Bhoi in FY 2023-24?",
+           "What did we discuss so far?", "What about FY 2022-23?"]),
+    # Phase 4: no place, year or question word matches; only the model can
+    # tell that "employment" means question 1's person-days.
+    # The user's own UI conversation of 2026-10-18 (app.conversation_turns,
+    # session_1792306638804): every turn after the first lost the context.
+    "U1": ("UI 2026-10-18: a measure after a data answer keeps its scheme and year",
+           ["Total MGNREGA person-days in 2023-24", "What is the total beneficiaries?",
+            "What is the total beneficiaries manraya?"]),
+    "U2": ("UI 2026-10-18: PMAY-G thread — spoken year, district list, meta follow-ups",
+           ["How many PMAY-G houses were sanctioned?",
+            "Okay. Ah, now give me how many houses are there in two zero, two three, two two zero two four.",
+            "Okay, now for the above question, don't give all of Meghalaya. Show me the districts. What are the districts are there?",
+            "Okay, now for the above query, you don't have a list of districts.",
+            "In the previous context, I am asking about PMAY-G, right? But why again you are giving the scheme names here?"]),
+    # ── wordings the matrix (tests/live_context_matrix.py) does not cover ──
+    "V1": ("'that number again' with one topic re-shows the last figure",
+           [Q_EKH, "What about Ri Bhoi?", "What was that number again?"]),
+    "V2": ("Hinglish backward reference",
+           [Q_EKH, "How many PMAY-G houses were completed in Ri Bhoi in FY 2023-24?",
+            "MGNREGA ka 2022 wala figure batao"]),
+    "V3": ("'same for PMAY-G' keeps the place and year",
+           [Q_EKH, "Same for PMAY-G"]),
+    "V4": ("mid-sentence comparison with an earlier answer",
+           [Q_EKH, "How many PMAY-G houses were completed in East Khasi Hills in FY 2022-23?",
+            "Compare this with the MGNREGA figure you showed"]),
+    "V5": ("'the second question' by order",
+           [Q_EKH, "How many PMAY-G houses were completed in Ri Bhoi in FY 2023-24?",
+            "Go back to the second question"]),
+    "V6": ("thanks + an off-topic question in a row, then a year follow-up",
+           [Q_EKH, "thanks", "who is the prime minister?", "and in FY 2023-24?"]),
+    "R": ("A reference only the model can place (Phase 4)",
+          [Q_EKH, "How many PMAY-G houses were completed in Ri Bhoi in FY 2023-24?",
+           "What was that employment figure you gave earlier?"]),
+}
+
+def _auto_chip(label: str) -> bool:
+    """A chip that covers everything: the word 'all', or 'combined' / 'overall' /
+    'every' anywhere (case-insensitive)."""
+    low = (label or "").lower()
+    return "all" in words(low) or any(w in low for w in ("combined", "overall", "every"))
+
+
+# ── Reachability ────────────────────────────────────────────────────────────
+def _reachable(url_or_host: str, port: int | None = None, timeout: float = 3.0) -> bool:
+    host = urlparse(url_or_host).hostname if "://" in url_or_host else url_or_host
+    port = port or (urlparse(url_or_host).port or 443)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+# ── Legacy mode (the implementation before 2026-09-26), for A/B ─────────────
+def _install_legacy():
+    def legacy_prompt(question, prev, extra_context="", kind=None, cleared=None):
+        prompt = (
+            "Rewrite the FOLLOW-UP as a complete, standalone question by reusing "
+            "context from the PREVIOUS question. Keep the user's intent; change only "
+            "what the follow-up changes (e.g. a different district, year, or metric). "
+            "Do not introduce any district, year, tranche, scheme, category or other "
+            "filter that is not present in the PREVIOUS question, the PREVIOUS answer, "
+            "the Known context below, or the FOLLOW-UP itself — when in doubt, leave it "
+            "out rather than guess one. "
+            "Return ONLY the rewritten question, nothing else.\n\n"
+            + (f"{extra_context}\n\n" if extra_context else "")
+            + f'PREVIOUS question: "{prev.question}"\n'
+            f'PREVIOUS answer (for context): "{(prev.answer or "")[:300]}"\n'
+            f'FOLLOW-UP: "{question}"\n\n'
+            "Standalone question:")
+        return [("legacy", prompt)], ["legacy_answer_slice"], {
+            "question": question, "allowed_text": "", "allowed_schemes": [], "denied_text": ""}
+
+    # Everything the 2026-09-26 context work added to the rewrite path is switched
+    # off: the evidence tiers and removed-filter line (legacy prompt above), the
+    # provenance checks, the merge plan's pruning of inherited filters, and the
+    # scope-less follow-up detection. Shared state (session_sync) stays on, so
+    # the A/B isolates the context logic from the worker-routing fix.
+    pipeline._build_rewrite_prompt = legacy_prompt
+    pipeline._rewrite_provenance_violation = lambda *a, **k: None
+    pipeline.is_scopeless_followup = lambda *a, **k: False
+    context_policy.apply_merge_plan = lambda prior, plan: dict(prior or {})
+
+
+# ── Capture of prompt_context records and timed stages ─────────────────────
+class _PromptCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.INFO)
+        self.records: list[dict] = []
+
+    def emit(self, record):
+        msg = record.getMessage()
+        if msg.startswith("prompt_context "):
+            try:
+                self.records.append(json.loads(msg[len("prompt_context "):]))
+            except ValueError:
+                pass
+
+
+_stage_times: list[dict] = []
+
+
+def _time_stage(obj, name, label):
+    orig = getattr(obj, name)
+
+    async def wrapped(*a, **k):
+        t = time.perf_counter()
+        try:
+            return await orig(*a, **k)
+        finally:
+            _stage_times.append({"stage": label, "ms": round((time.perf_counter() - t) * 1000, 1)})
+    setattr(obj, name, wrapped)
+
+
+# ── One conversation ────────────────────────────────────────────────────────
+class Conversation:
+    def __init__(self, sid: str, workers: int, db_sync: bool, tenant_id: int):
+        self.sid, self.db_sync, self.tenant_id = sid, db_sync, tenant_id
+        self.stores = [SessionStore(ttl=1800, max_sessions=10, max_turns=8)
+                       for _ in range(workers if db_sync else 1)]
+        self.turn_no = 0
+        self.sync_log: list[str] = []
+        self.sync_ms: list[tuple[str, float]] = []
+
+    async def ask(self, question: str, capture: _PromptCapture, *, auto_click=True,
+                  seed_answer: str | None = None) -> dict:
+        store = self.stores[self.turn_no % len(self.stores)]
+        self.turn_no += 1
+        session = store.ensure(self.sid, "live-harness")
+        if self.db_sync:
+            t_sync = time.perf_counter()
+            self.sync_log.append(await session_sync.sync_in(session, self.sid))
+            self.sync_ms.append(("in", round((time.perf_counter() - t_sync) * 1000, 1)))
+        if seed_answer is not None and session.last_turn is not None:
+            session.last_turn.answer = seed_answer       # Scenario G: contaminate the antecedent
+        rec = {"worker": self.stores.index(store), "question": question, "chain": []}
+        q = question
+        for _hop in range(3):
+            calls: list = []
+            token = llm.llm_calls_var.set(calls)
+            n_prompts = len(capture.records)
+            stage_start = len(_stage_times)
+            t0 = time.perf_counter()
+            step = {"asked": q, "cacheable": router.is_cacheable(q, session)}
+            try:
+                # The router's conversation layer first (expiry, reset, recall,
+                # measure-after-knowledge), exactly as POST /api/query runs it.
+                layer = await conversation_layer.prepare_turn(session, q)
+                step["layer_action"] = layer.action
+                step["cacheable"] = step["cacheable"] and not layer.changed
+                if layer.response is not None:
+                    result = layer.response
+                elif layer.multi:
+                    result = await conversation_layer.answer_many(
+                        layer.multi, lambda x: pipeline.answer_question(x, session=session, scope=None))
+                else:
+                    result = await pipeline.answer_question(layer.question, session=session, scope=None)
+                # The router restyles a refusal before the turn is kept
+                # (routers.query._answer); that also marks it an aside, so the
+                # topic carries on after "who won the cricket match?".
+                styled = conversation_replies.restyle(session, q, result)
+                if styled is not None:
+                    result = styled
+                session.turns.append(router.build_turn(q, result))
+                step.update(kind="answer", result=result)
+            except ClarificationNeeded as e:
+                router.remember_pause(session, q, e)
+                step.update(kind="clarification", rule=e.rule,
+                            options=[o.get("label") for o in (e.options or [])], result=None,
+                            clar_options=e.options)
+            finally:
+                llm.llm_calls_var.reset(token)
+            step["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+            step["llm_calls"] = calls
+            step["prompts"] = capture.records[n_prompts:]
+            step["stages"] = _stage_times[stage_start:]
+            step["plan"] = dict(session.turn_context.get("plan") or {})
+            step["substituted"] = session.turn_context.get("substituted_question")
+            step["state"] = {k: getattr(session.state, k) for k in
+                             ("scheme", "district", "block", "village", "year", "metric", "tranche")}
+            step["provenance"] = dict(session.state.provenance)
+            rec["chain"].append(step)
+            if step["kind"] == "clarification" and auto_click and step.get("clar_options"):
+                opts = step["clar_options"]
+                chip = next((o for o in opts if _auto_chip(o.get("label", ""))), opts[0])
+                step["auto_clicked"] = chip.get("label")
+                q = chip.get("question") or chip.get("label")
+                continue
+            break
+        if self.db_sync:
+            t_sync = time.perf_counter()
+            ok = await session_sync.sync_out(session, self.sid, tenant_id=self.tenant_id,
+                                             user_id=None, title=question)
+            self.sync_ms.append(("out", round((time.perf_counter() - t_sync) * 1000, 1)))
+            self.sync_log.append("saved" if ok else "save-failed")
+        final = rec["chain"][-1]
+        res = final.get("result") or {}
+        rec.update(
+            final_kind=final["kind"], rule=final.get("rule"),
+            rewritten=res.get("rewritten_question"), route=res.get("route"),
+            schemes=res.get("schemes"), resolved=res.get("resolved_entities"),
+            sql=res.get("sql"), row_count=res.get("row_count"),
+            rows_head=(res.get("rows") or res.get("data") or [])[:3],
+            answer=(res.get("answer") or final.get("rule") or "")[:400],
+            state=final["state"], provenance=final["provenance"], plan=final["plan"],
+            rewrite_tiers=[p_.get("tiers") for p_ in final["prompts"] if p_.get("kind") == "rewrite"],
+            rewrite_guard=[p_.get("guard") for p_ in final["prompts"] if p_.get("kind") == "rewrite"],
+            cacheable_first=rec["chain"][0]["cacheable"],
+            scope_banner=res.get("scope_banner"))
+        return rec
+
+
+# ── Expectations ───────────────────────────────────────────────────────────
+def _sql(t):
+    return (t.get("sql") or "").upper()
+
+
+def _has(t, *needles):
+    s = _sql(t)
+    return all(n.upper() in s for n in needles)
+
+
+def _no(t, *needles):
+    s = _sql(t) + " " + (t.get("rewritten") or "").upper()
+    return [n for n in needles if n.upper() in s]
+
+
+def _year_in_sql(t, y):
+    return str(y) in _sql(t)
+
+
+def _ranks(sql: str) -> bool:
+    """Ranks: an ORDER BY ... DESC anywhere in the query, or a MAX() (SQLGlot tree)."""
+    if sql_ast.has_aggregate(sql, "max"):
+        return True
+    return any(o.args.get("desc") for t in sql_ast.parse(sql) for o in t.find_all(exp.Ordered))
+
+
+def check(name, ok, detail=""):
+    return {"check": name, "ok": bool(ok), "detail": str(detail)[:300]}
+
+
+def expectations(key, turns):
+    c = []
+    if key in ("A", "B", "F", "G"):
+        t1 = turns[0]
+        c.append(check("T1 Focus Plus, West Garo Hills, FY 2025-26",
+                       t1["schemes"] == ["Focus Plus"] and _has(t1, "WEST GARO HILLS")
+                       and _year_in_sql(t1, 2025), t1["sql"]))
+    if key == "A":
+        t2, t3 = turns[1], turns[2]
+        c += [check("T2 geography changes to Dalu block", _has(t2, "DALU"), t2["sql"]),
+              check("T2 scheme and year kept", t2["schemes"] == ["Focus Plus"]
+                    and _year_in_sql(t2, 2025), t2["sql"]),
+              check("T2 metric kept (money)", sql_ast.has_aggregate(t2.get("sql") or "", "sum"), t2["sql"]),
+              check("T2 kind GEOGRAPHY_CHANGE", t2["plan"].get("kind") == "GEOGRAPHY_CHANGE",
+                    t2["plan"]),
+              check("T3 metric changes to a count", sql_ast.has_aggregate(t3.get("sql") or "", "count"),
+                    t3["sql"]),
+              check("T3 scheme, Dalu and year kept", t3["schemes"] == ["Focus Plus"]
+                    and _has(t3, "DALU") and _year_in_sql(t3, 2025), t3["sql"]),
+              check("T3 kind METRIC_CHANGE, filters only", t3["plan"].get("kind") == "METRIC_CHANGE"
+                    and all("result" not in (x or []) for x in t3["rewrite_tiers"]),
+                    [t3["plan"], t3["rewrite_tiers"]])]
+    if key == "B":
+        t2 = turns[1]
+        first = t2["chain"][0]
+        c += [check("T2 'last year' resolved to FY 2024-25", "2024-25" in (first.get("substituted") or ""),
+                    first.get("substituted")),
+              check("T2 honestly paused: FY 2024-25 is not held for Focus Plus",
+                    first.get("rule") == "year-out-of-range" or (_year_in_sql(t2, 2024)
+                                                                 and not _year_in_sql(t2, 2025)),
+                    [first.get("rule"), t2["sql"]])]
+    if key == "B2":
+        t1, t2 = turns[0], turns[1]
+        c += [check("T1 MGNREGA, West Garo Hills, FY 2024-25", t1["schemes"] == ["MGNREGA"]
+                    and _has(t1, "WEST GARO HILLS") and _year_in_sql(t1, 2024), t1["sql"]),
+              check("T2 year changes to FY 2023-24", _year_in_sql(t2, 2023)
+                    and not _year_in_sql(t2, 2024), t2["sql"]),
+              check("T2 scheme/district/metric kept", t2["schemes"] == ["MGNREGA"]
+                    and _has(t2, "WEST GARO HILLS") and "PERSON_DAYS" in _sql(t2), t2["sql"]),
+              check("T2 year provenance is resolved_reference or current_user",
+                    (t2["provenance"].get("year") or {}).get("source")
+                    in ("resolved_reference", "current_user"), t2["provenance"].get("year"))]
+    if key == "C":
+        t2 = turns[1]
+        c += [check("T2 grouped by district", "GROUP BY" in _sql(t2) and "DISTRICT" in _sql(t2),
+                    t2["sql"]),
+              check("T2 district filter dropped", "= 'WEST GARO HILLS'" not in _sql(t2), t2["sql"]),
+              check("T2 scheme kept", t2["schemes"] == ["Focus Plus"], t2["schemes"])]
+    if key == "D":
+        t2, t3 = turns[1], turns[2]
+        top = next((str(v) for v in (t2["rows_head"][0].values() if t2["rows_head"] else [])
+                    if isinstance(v, str)), None)
+        c += [check("T2 ranks (ORDER BY ... DESC / MAX)",
+                    _ranks(t2.get("sql") or ""), t2["sql"]),
+              check("T2 not given the result rows", all("result" not in (x or [])
+                                                        for x in t2["rewrite_tiers"]),
+                    t2["rewrite_tiers"]),
+              check("T3 given the result rows (RESULT_REFERENCE)",
+                    t3["plan"].get("kind") == "RESULT_REFERENCE"
+                    and any("result" in (x or []) for x in t3["rewrite_tiers"]),
+                    [t3["plan"], t3["rewrite_tiers"]]),
+              check("T3 filters on T2's top district", top is not None
+                    and top.upper() in _sql(t3), [top, t3["sql"]])]
+    if key == "E":
+        t1, t2 = turns[0], turns[1]
+        c += [check("T1 asks which scheme", t1["chain"][0].get("rule") == "scheme-not-specified",
+                    t1["chain"][0].get("rule")),
+              check("T2 reply not cacheable", t2["cacheable_first"] is False, t2["cacheable_first"]),
+              check("T2 resumes the paused question",
+                    "BENEFICIAR" in ((t2["chain"][0].get("result") or {}).get("rewritten_question")
+                                     or t2["rewritten"] or "").upper()
+                    or t2["chain"][0].get("kind") == "clarification",
+                    [t2["rewritten"], t2["chain"][0].get("rule")]),
+              check("T2 answers for Focus Plus", t2["schemes"] == ["Focus Plus"], t2["schemes"])]
+    if key == "F":
+        t2, t3, t4, t5 = turns[1:5]
+        c += [check("T2 switches to MGNREGA", t2["schemes"] == ["MGNREGA"]
+                    and "FOCUS_PLUS" not in _sql(t2), t2["sql"]),
+              check("T3 continues MGNREGA, not Focus Plus", t3["schemes"] == ["MGNREGA"]
+                    and "FOCUS_PLUS" not in _sql(t3) and _has(t3, "DALU"), t3["sql"]),
+              check("T4 switches to Focus Legacy only", t4["schemes"] == ["Focus Legacy"]
+                    and "V_EMPLOYMENT" not in _sql(t4), t4["sql"]),
+              # D-090 (user 2026-10-29, RAG fix report Issue 8): "applications /
+              # applicants / applied" settle a bare "CM Elevate" as the applications
+              # dataset — no dataset pause. (D-064, 2026-10-22, asked here; a bare
+              # "CM Elevate records" with no such word still asks.)
+              check("T5 'applications' answers from CM Elevate applications (D-090)",
+                    t5["chain"][0].get("rule") != "cm-elevate-dataset" and t5["schemes"] == ["CM Elevate"],
+                    [t5["chain"][0].get("rule"), t5["schemes"]])]
+    if key == "H":
+        t3 = turns[2]
+        c += [check("T3 stays PMAY-G", t3["schemes"] == ["PMAY-G"], t3["schemes"]),
+              check("T3 West Garo Hills, not the old South Garo Hills", _has(t3, "WEST GARO HILLS")
+                    and not _has(t3, "SOUTH GARO HILLS"), t3["sql"]),
+              check("T3 keeps FY 2022-23 from the data turn", _year_in_sql(t3, 2022), t3["sql"]),
+              check("T3 keeps the completed-houses measure", "IS_COMPLETED" in _sql(t3), t3["sql"])]
+    if key == "I":
+        t2 = turns[1]
+        c += [check("T2 switches to MGNREGA (not merged into the PMAY-G pause)",
+                    t2["schemes"] == ["MGNREGA"], t2["schemes"]),
+              check("T2 runs no PMAY-G query", "V_PMAY" not in _sql(t2), t2["sql"])]
+    if key == "J":
+        t2 = turns[1]
+        text = ((t2.get("rewritten") or "") + " " + (t2.get("answer") or "")).lower()
+        c += [check("T2 'its' is Gram Panchayat", "panchayat" in text, t2.get("rewritten")),
+              check("T2 not 'the assistant's role'", "assistant" not in (t2.get("rewritten") or "").lower(),
+                    t2.get("rewritten"))]
+    if key == "K":
+        t3 = turns[2]
+        c += [check("T3 is PMAY-G (the knowledge turn switched the topic)", t3["schemes"] == ["PMAY-G"],
+                    t3["schemes"]),
+              check("T3 FY 2023-24", _year_in_sql(t3, 2023), t3["sql"]),
+              check("T3 no MGNREGA / East Khasi Hills leak", not _no(t3, "V_EMPLOYMENT", "EAST KHASI"),
+                    t3["sql"])]
+    if key == "L":
+        t3 = turns[2]
+        c += [check("T3 stays PMAY-G completed houses", t3["schemes"] == ["PMAY-G"]
+                    and "IS_COMPLETED" in _sql(t3), t3["sql"]),
+              check("T3 Ri Bhoi", _has(t3, "RI BHOI"), t3["sql"]),
+              check("T3 no old metric / comparison leak", not _no(t3, "PERSON_DAYS", "EAST KHASI"), t3["sql"])]
+    if key == "M":
+        t2 = turns[1]
+        c += [check("T2 PMAY-G", t2["schemes"] == ["PMAY-G"] or t2["final_kind"] == "clarification",
+                    t2["schemes"]),
+              check("T2 'this year' is not the session's FY 2022-23",
+                    not _year_in_sql(t2, 2022) and "2022" not in (t2.get("rewritten") or ""),
+                    (t2.get("rewritten"), t2["sql"]))]
+    if key == "N":
+        t2, t3 = turns[1], turns[2]
+        c += [check("T2 answered as out of scope, no query", not t2.get("sql"), t2.get("sql")),
+              check("T3 MGNREGA, West Garo Hills, FY 2023-24", t3["schemes"] == ["MGNREGA"]
+                    and _has(t3, "WEST GARO HILLS") and _year_in_sql(t3, 2023)
+                    and not _year_in_sql(t3, 2024), t3["sql"])]
+    if key == "O":
+        t5 = turns[4]
+        c += [check("T5 restores question 1: MGNREGA, East Khasi Hills, FY 2022-23",
+                    t5["schemes"] == ["MGNREGA"] and _has(t5, "EAST KHASI HILLS") and _year_in_sql(t5, 2022),
+                    t5["sql"]),
+              check("T5 not the later West Garo Hills question", not _has(t5, "WEST GARO HILLS"), t5["sql"]),
+              check("T5 person-days, not job cards", "PERSON_DAYS" in _sql(t5), t5["sql"]),
+              check("T5 not cacheable", t5["cacheable_first"] is False, t5["cacheable_first"]),
+              check("T5 scope banner says it is from earlier",
+                    "East Khasi Hills" in (t5.get("scope_banner") or "")
+                    and "(from earlier)" in (t5.get("scope_banner") or ""), t5.get("scope_banner"))]
+    if key == "P":
+        t3 = turns[2]
+        c += [check("T3 MGNREGA East Khasi Hills (question 1's scope)", t3["schemes"] == ["MGNREGA"]
+                    and _has(t3, "EAST KHASI HILLS") and not _has(t3, "RI BHOI"), t3["sql"]),
+              check("T3 FY 2023-24", _year_in_sql(t3, 2023) and not _year_in_sql(t3, 2022), t3["sql"])]
+    if key == "Q":
+        t3, t4 = turns[2], turns[3]
+        c += [check("T3 lists the questions", t3["route"] == "edge" and "covered so far" in (t3["answer"] or ""),
+                    t3["answer"]),
+              check("T4 continues PMAY-G Ri Bhoi in FY 2022-23", t4["schemes"] == ["PMAY-G"]
+                    and _has(t4, "RI BHOI") and _year_in_sql(t4, 2022), t4["sql"])]
+    if key == "V1":
+        t3 = turns[2]
+        c += [check("T3 MGNREGA, Ri Bhoi (the last figure)", t3["schemes"] == ["MGNREGA"] and _has(t3, "RI BHOI"),
+                    [t3["schemes"], t3["sql"], (t3.get("answer") or "")[:120]])]
+    if key == "V2":
+        t3 = turns[2]
+        c += [check("T3 MGNREGA East Khasi Hills FY 2022-23", t3["schemes"] == ["MGNREGA"]
+                    and _has(t3, "EAST KHASI HILLS") and _year_in_sql(t3, 2022), [t3["schemes"], t3["sql"]])]
+    if key == "V3":
+        t2 = turns[1]
+        c += [check("T2 PMAY-G, East Khasi Hills, FY 2022-23", t2["schemes"] == ["PMAY-G"]
+                    and _has(t2, "EAST KHASI HILLS") and _year_in_sql(t2, 2022), [t2["schemes"], t2["sql"]])]
+    if key == "V4":
+        t3 = turns[2]
+        c += [check("T3 compares MGNREGA and PMAY-G (both named)", set(t3["schemes"] or []) >= {"MGNREGA", "PMAY-G"}
+                    or ("MGNREGA" in (t3.get("answer") or "") and "PMAY" in (t3.get("answer") or "")),
+                    [t3["schemes"], (t3.get("answer") or "")[:160]]),
+              check("T3 East Khasi Hills, FY 2022-23", ("EAST KHASI" in _sql(t3) or "East Khasi" in (t3.get("answer") or ""))
+                    and ("2022" in _sql(t3) or "2022-23" in (t3.get("answer") or "")), [t3["sql"], (t3.get("answer") or "")[:120]])]
+    if key == "V5":
+        t3 = turns[2]
+        c += [check("T3 PMAY-G Ri Bhoi FY 2023-24", t3["schemes"] == ["PMAY-G"] and _has(t3, "RI BHOI")
+                    and _year_in_sql(t3, 2023), [t3["schemes"], t3["sql"]])]
+    if key == "V6":
+        t4 = turns[3]
+        c += [check("T2/T3 no query", not turns[1].get("sql") and not turns[2].get("sql"),
+                    [turns[1].get("route"), turns[2].get("route")]),
+              check("T4 MGNREGA East Khasi Hills FY 2023-24", t4["schemes"] == ["MGNREGA"]
+                    and _has(t4, "EAST KHASI HILLS") and _year_in_sql(t4, 2023), [t4["schemes"], t4["sql"]])]
+    if key == "R":
+        t3 = turns[2]
+        c += [check("T3 the model restored question 1: MGNREGA, East Khasi Hills, FY 2022-23",
+                    t3["schemes"] == ["MGNREGA"] and _has(t3, "EAST KHASI HILLS") and _year_in_sql(t3, 2022)
+                    or t3["final_kind"] == "clarification", [t3["final_kind"], t3["sql"]]),
+              check("T3 not PMAY-G Ri Bhoi", not _has(t3, "RI BHOI"), t3["sql"])]
+    if key == "U1":
+        t2, t3 = turns[1], turns[2]
+        for i, t in ((2, t2), (3, t3)):
+            c += [check(f"T{i} MGNREGA only (not every scheme)", t["schemes"] == ["MGNREGA"], t["schemes"]),
+                  check(f"T{i} keeps FY 2023-24", _year_in_sql(t, 2023) or "2023-24" in (t.get("answer") or ""),
+                        [t.get("sql"), (t.get("answer") or "")[:120]])]
+    if key == "U2":
+        t2, t3, t4, t5 = turns[1:5]
+        first3 = t3["chain"][0]
+        c += [check("T2 FY 2023-24 read from the spoken year (not all years)",
+                    "all financial years" not in (t2.get("answer") or "").lower()
+                    and ("2023-24" in (t2.get("answer") or "") or _year_in_sql(t2, 2023)), (t2.get("answer") or "")[:150]),
+              check("T3 offers the districts (district chips) or answers by district",
+                    (first3.get("kind") == "clarification" and len(first3.get("options") or []) >= 5)
+                    or (t3["schemes"] == ["PMAY-G"] and "DISTRICT" in _sql(t3) and "GROUP BY" in _sql(t3)),
+                    [first3.get("kind"), (first3.get("options") or [])[:3], (t3.get("answer") or "")[:120]]),
+              check("T4 stays on PMAY-G (no 'which scheme?')", t4["chain"][0].get("rule") != "scheme-not-specified"
+                    and (t4["schemes"] in (["PMAY-G"], []) ), [t4["chain"][0].get("rule"), t4["schemes"],
+                                                                (t4.get("answer") or "")[:150]]),
+              check("T5 confirms PMAY-G, no refusal", "PMAY" in (t5.get("answer") or "")
+                    and "outside" not in (t5.get("answer") or "").lower()
+                    and "don't have information" not in (t5.get("answer") or "").lower(), (t5.get("answer") or "")[:200])]
+    if key == "G":
+        for i, t in enumerate(turns[1:], start=2):
+            leaked = _no(t, *CONTAMINANTS)
+            c.append(check(f"T{i} no entity from the contaminated answer", not leaked, leaked))
+        c.append(check("T2 Dalu applied", _has(turns[1], "DALU"), turns[1]["sql"]))
+    return c
+
+
+# ── Metrics ────────────────────────────────────────────────────────────────
+def _pct(values, q):
+    if not values:
+        return None
+    values = sorted(values)
+    k = max(0, min(len(values) - 1, round(q * (len(values) - 1))))
+    return values[k]
+
+
+def summarize(all_turns):
+    calls = [c for t in all_turns for s in t["chain"] for c in s["llm_calls"]]
+    by_role: dict = {}
+    for c in calls:
+        r = by_role.setdefault(c["role"], {"calls": 0, "prompt_tokens": [], "completion_tokens": [],
+                                            "latency_ms": []})
+        r["calls"] += 1
+        for k in ("prompt_tokens", "completion_tokens", "latency_ms"):
+            if c.get(k) is not None:
+                r[k].append(c[k])
+    roles = {role: {"calls": r["calls"],
+                    "input_tokens_total": sum(r["prompt_tokens"]) if r["prompt_tokens"] else None,
+                    "input_tokens_mean": round(statistics.mean(r["prompt_tokens"]), 1)
+                    if r["prompt_tokens"] else None,
+                    "output_tokens_total": sum(r["completion_tokens"]) if r["completion_tokens"] else None,
+                    "latency_p50_ms": _pct(r["latency_ms"], 0.5),
+                    "latency_p95_ms": _pct(r["latency_ms"], 0.95),
+                    "ttft": "n/a: not streamed; equals latency"}
+             for role, r in by_role.items()}
+    stages = [s for t in all_turns for st in t["chain"] for s in st["stages"]]
+    stage_lat = {}
+    for label in ("rewrite", "sql_generation"):
+        v = [s["ms"] for s in stages if s["stage"] == label]
+        stage_lat[label] = {"n": len(v), "p50_ms": _pct(v, 0.5), "p95_ms": _pct(v, 0.95)}
+    turn_lat = [s["latency_ms"] for t in all_turns for s in t["chain"]]
+    data_turns = [t for t in all_turns if t["final_kind"] == "answer" and t["route"] == "data"]
+    sql_ok = [t for t in data_turns if t["sql"] and "couldn't build a working query" not in t["answer"]]
+    return {"llm_by_role": roles, "stages": stage_lat,
+            "rewrite_prompt_tokens_approx": _rewrite_tokens(all_turns),
+            "turn_latency_ms": {"p50": _pct(turn_lat, 0.5), "p95": _pct(turn_lat, 0.95)},
+            "sql_success": f"{len(sql_ok)}/{len(data_turns)}"}
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+async def main(args) -> int:
+    report = {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "mode": "legacy" if args.legacy else "semantic",
+              "models": {"classifier/rewrite": settings.CLASSIFIER_MODEL,
+                         "sql": settings.SQL_GENERATION_MODEL, "verifier": settings.SQL_VERIFY_MODEL,
+                         "composer": settings.RESPONSE_MODEL},
+              "db_sync": not args.no_db_sync}
+    gw_ok = _reachable(settings.SQL_GENERATION_BASE_URL)
+    _db = urlparse(settings.DATABASE_URL) if settings.DATABASE_URL else None
+    db_ok = bool(_db and _db.hostname) and _reachable(_db.hostname, _db.port or 5432)
+    if not (gw_ok and db_ok):
+        report["status"] = "not_run"
+        report["reason"] = f"unreachable: gateway={gw_ok} db={db_ok} (VPN off?)"
+        print(f"SKIPPED - {report['reason']}")
+        _write(args.out, report)
+        return 3
+
+    if args.legacy:
+        _install_legacy()
+    _time_stage(pipeline, "rewrite_followup", "rewrite")
+    _time_stage(pipeline, "generate_sql", "sql_generation")
+    capture = _PromptCapture()
+    logging.getLogger("app.context_budget").addHandler(capture)
+    logging.getLogger("app.context_budget").setLevel(logging.INFO)
+
+    from app import db, main as app_main
+    sids: list[str] = []
+    results, all_checks = {}, []
+    keys = [k.strip().upper() for k in args.only.split(",")] if args.only else list(SCENARIOS)
+    async with app_main.lifespan(app_main.app):
+        try:
+            for key in keys:
+                title, qs = SCENARIOS[key]
+                sid = f"live-ctx-{key}-{uuid.uuid4().hex[:8]}"
+                sids.append(sid)
+                conv = Conversation(sid, 3, not args.no_db_sync, args.tenant_id)
+                turns = []
+                for i, q in enumerate(qs):
+                    turns.append(await conv.ask(
+                        q, capture, auto_click=not ((key == "E" and i == 0) or (key == "B" and i == 1)
+                                     or (key == "I" and i == 0)),
+                        seed_answer=ANSWER_G if (key == "G" and i == 1) else None))
+                checks = expectations(key, turns)
+                if not args.no_db_sync:
+                    checks.append(check("state crossed workers (every sync_in after turn 1 applied)",
+                                        all(s == "applied" for s in conv.sync_log[2::2]),
+                                        conv.sync_log))
+                results[key] = {"title": title, "turns": turns, "checks": checks,
+                                "sync": conv.sync_log, "sync_ms": conv.sync_ms}
+                all_checks += [(key, c) for c in checks]
+                print(f"\n== {key}. {title}")
+                for t in turns:
+                    print(f"  [{t['worker']}] {t['question']}\n      -> {t['rewritten'] or '(unchanged)'}"
+                          f" | kind={t['plan'].get('kind')} | tiers={t['rewrite_tiers']}"
+                          f" | guard={t['rewrite_guard']}\n      SQL: {(t['sql'] or t['rule'] or '')[:220]}")
+                for c in checks:
+                    print(f"  {'PASS' if c['ok'] else 'FAIL'}  {c['check']}"
+                          + ("" if c["ok"] else f"  :: {c['detail']}"))
+        finally:
+            if sids and not args.no_db_sync:
+                try:
+                    await db.execute("DELETE FROM app.conversations WHERE session_id = ANY($1::text[])",
+                                     [sids])
+                except Exception as e:  # noqa: BLE001
+                    print(f"cleanup of {sids} failed: {e}")
+    all_turns = [t for r in results.values() for t in r["turns"]]
+    report.update(status="run", scenarios=results,
+                  metrics={**summarize(all_turns), **_sync_latency(results)},
+                  checks_passed=sum(c["ok"] for _, c in all_checks), checks_total=len(all_checks),
+                  followup_resolution_accuracy=_followup_accuracy(results))
+    print("\nMETRICS", json.dumps(report["metrics"], indent=1))
+    print(f"CHECKS {report['checks_passed']}/{report['checks_total']}  "
+          f"follow-up resolution {report['followup_resolution_accuracy']}")
+    _write(args.out, report)
+    return 0 if report["checks_passed"] == report["checks_total"] else 1
+
+
+def _rewrite_tokens(all_turns):
+    v = [pr["total_tokens"] for t in all_turns for st in t["chain"] for pr in st["prompts"]
+         if pr.get("kind") == "rewrite"]
+    return {"n": len(v), "mean": round(statistics.mean(v), 1) if v else None, "max": max(v) if v else None}
+
+
+def _sync_latency(results):
+    out = {}
+    for d in ("in", "out"):
+        v = [ms for r in results.values() for (k, ms) in r.get("sync_ms", []) if k == d]
+        out[f"sync_{d}"] = {"n": len(v), "p50_ms": _pct(v, 0.5), "p95_ms": _pct(v, 0.95)}
+    return out
+
+
+def _followup_accuracy(results):
+    fu = [c for r in results.values() for c in r["checks"]
+          if c["check"][:1] == "T" and c["check"][1:2] in tuple("23456789")]
+    return f"{sum(c['ok'] for c in fu)}/{len(fu)}"
+
+
+def _write(path, report):
+    if not path:
+        return
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(report, indent=1, default=str), encoding="utf-8")
+    print(f"report written to {path}")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--legacy", action="store_true", help="pre-2026-09-26 rewrite (answer[:300]) for A/B")
+    ap.add_argument("--only", default="", help="comma-separated scenario keys, e.g. A,E")
+    ap.add_argument("--no-db-sync", action="store_true", help="single worker, no app.conversations writes")
+    ap.add_argument("--tenant-id", type=int, default=1, help="tenant_id for the temporary rows")
+    # A dated file per run (QA-03, 2026-10-29): the fixed path overwrote the
+    # previous run, so a before / after pair could not be kept.
+    ap.add_argument("--out", default=f"logs/live_context_validation_{time.strftime('%Y-%m-%d_%H%M')}.json")
+    sys.exit(asyncio.run(main(ap.parse_args())))

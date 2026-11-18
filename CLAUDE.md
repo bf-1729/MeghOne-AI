@@ -1,0 +1,258 @@
+# CLAUDE.md — Megh One AI (Meghalaya Conversational Analytics Chatbot)
+
+Read this first, every session. It is short on purpose; details live in `docs/`.
+
+## 1. What this is
+
+One FastAPI service (`app/`) that answers Meghalaya government officers' natural-language
+questions about **six scheme datasets**: MGNREGA, PMAY-G, Focus Plus, CM Elevate, Focus Legacy
+and CM Elevate Legacy.
+
+- **Data questions** → NL→SQL against PostgreSQL `megh_db` (schema `curated`), then an
+  LLM-composed answer.
+- **"How does the scheme work"** questions → RAG over Qdrant (reference docs in `data/incoming/<scheme>/`).
+- **Greetings / off-topic / abuse** → regex edge layer, with no model call.
+
+All model inference is remote, on a self-hosted vLLM gateway (`10.48.242.4`). The UI is a **React**
+app in `frontend/` (Vite; D-038), built into `web/app/` and served by the same app at `/megh-chat`
+and `/admin-ui`. **No WebSocket.** Answers stream over SSE (`POST /api/query/stream`, D-039):
+the streamed text is a draft, and every faithfulness check still runs on the full answer. After
+any change in `frontend/src`, run `npm run build` in `frontend/` (the app serves the build, not
+the source).
+
+## 2. Architecture in one breath
+
+`POST /api/query` → JWT auth → cache (exact, then semantic) → `pipeline.answer_question` →
+deterministic pre-routing and edge → follow-up rewrite → intent (DATA/KNOWLEDGE) →
+- **DATA:** scheme gate → `classify_scheme` → `resolve_entities` → clarification gates →
+  `generate_sql` → `auth.authorize` → `execute_with_repair` (regex guards + LLM verifier + up to
+  3 repairs) → `compose_response` (numeric-faithfulness checks).
+- **KNOWLEDGE:** `rag.answer_from_kb`.
+
+The orchestration lives in the **[app/pipeline/](app/pipeline/) package** (one 18,700-line `pipeline.py`
+until 2026-10-15):
+- [app/pipeline/common/](app/pipeline/common/) — the shared steps every scheme goes through,
+  `c01_followups.py` … `c16_metric_catalog.py` (the data team's metric catalogue as a fixed query, D-071),
+  `c17_data_answer_rules.py` (sub-asks, SQL hygiene, runners-up, money units, dataset caveats; D-092);
+- [app/pipeline/schemes/](app/pipeline/schemes/) — **one file per scheme** (`mgnrega.py`, `pmay_g.py`,
+  `focus_plus.py`, `cm_elevate.py`, `focus_legacy.py`, `cm_elevate_legacy.py`): that scheme's village
+  rules, fixed queries, SQL rewrites and answer checks. A scheme-only fix goes in its scheme file.
+
+`app/pipeline/__init__.py` executes the files in `_PIPELINE_FILES` order into ONE shared namespace, so
+`from app import pipeline as p`, `p.<name>` and `monkeypatch.setattr(p, …)` work as before. Function bodies may
+use names from any file; load-time code (constants, regexes, defaults) only names from files loaded before it.
+Every top-level name must be unique across the files: a second definition silently replaces the first for every caller
+(KI-413; `tests/test_pipeline_namespace_2026_10_26.py` fails on a duplicate).
+**Edit the file that holds the function** (there is no `app/pipeline.py` any more — recreating it would be
+shadowed by the package and silently ignored). It is written as
+**stage functions** (`_turn_*_stage`, `_data_*_stage`, `_execute_one_attempt`, …). **LangGraph is the only
+orchestrator** ([app/pipeline_graph.py](app/pipeline_graph.py), D-032, D-036): there is no sequential driver,
+no on/off switch and no canary, and none may be added back. **Change behaviour in a stage, never in a graph
+node.** Tests drive turns through the graph with `tests/_graph_turn.py`.
+Full map: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/AI_PIPELINE.md](docs/AI_PIPELINE.md),
+[docs/LANGGRAPH_ARCHITECTURE.md](docs/LANGGRAPH_ARCHITECTURE.md).
+
+## 3. Documentation map
+
+| Doc | Read it when |
+|---|---|
+| [docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md) | Onboarding: what, why, capabilities, constraints |
+| [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) | **Every session.** What works, what's broken, what's next |
+| [docs/HANDOFF.md](docs/HANDOFF.md) | **Every session.** Where the last session stopped |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, API, auth, deploy, infrastructure |
+| [docs/AI_PIPELINE.md](docs/AI_PIPELINE.md) | Any change to routing, prompts, SQL gen/repair, composer, RAG |
+| [docs/DATA_MODEL.md](docs/DATA_MODEL.md) | Any change touching SQL, tables, joins, units, years |
+| [docs/SCHEMES.md](docs/SCHEMES.md) | Any scheme-specific change, or adding a scheme |
+| [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) | Before fixing a bug (it may already be tracked) |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | **Before proposing any architectural replacement** |
+| [docs/TESTING.md](docs/TESTING.md) | Before and after changing code |
+| [docs/SECURITY.md](docs/SECURITY.md) | OWASP control map, deploy security checklist |
+| [docs/LANGGRAPH_ARCHITECTURE.md](docs/LANGGRAPH_ARCHITECTURE.md) | The LangGraph orchestrator: nodes, state, checkpointing, logs, adding a node |
+| [docs/CONTEXT_AND_LANGGRAPH.md](docs/CONTEXT_AND_LANGGRAPH.md) | How the context window runs inside the graph |
+| [docs/LANGGRAPH_PAUSE_RESUME.md](docs/LANGGRAPH_PAUSE_RESUME.md) | Clarification pauses as `interrupt()`; resume; the two stores |
+| [docs/LANGGRAPH_MIGRATION.md](docs/LANGGRAPH_MIGRATION.md) | Flags, rollout gates, rollback, measured overhead |
+| [deploy/DEPLOYMENT.md](deploy/DEPLOYMENT.md) | Deploying to the VMs |
+| `data/<scheme>/README.md` | The SME contract for one scheme's YAMLs (authoritative for that scheme) |
+
+Historical and reference documents: `docs/TECHNICAL_BRIEF.md` (a 2026-09-24 analysis snapshot
+whose line numbers are stale), `docs/*_DB_Issues.md`, `docs/*Fix_Verification*.md` (QA records)
+`docs/INFERENCE_REQUIREMENTS.md` (the AIOps handoff), `docs/MEGHALAYA_LANGGRAPH_ARCHITECTURE.md`
+(the 2026-10-02 pre-implementation analysis for the LangGraph work) and
+`docs/Context_Validation_Report_2026-09-26.md` (the live end-to-end context validation).
+
+## 4. Development principles
+
+- **Evidence order:** source code > DB schema > tests > config > docs > git history > chat memory.
+  If a doc disagrees with the code, the code wins, and you fix the doc.
+- **Don't break working behaviour.** No drive-by refactors, API changes, schema changes or
+  "cleaner" rewrites. Make small, targeted, tested changes.
+- **Almost every regex, gate and guard in the pipeline (`app/pipeline/`) exists because of a real reported
+  failure.** The comment above it usually says which one. Read that comment before changing or
+  removing it.
+- **Scheme facts live in `app/scheme_registry.py`** (D-079); the other registries (listed in
+  [docs/SCHEMES.md §Adding a scheme](docs/SCHEMES.md#adding-a-scheme)) keep their own shape and are
+  checked against it by `tests/test_scheme_registry_e5_2026_10_27.py`. Changing one scheme's name or
+  pattern means running that guard and fixing every registry it names.
+- **Two name collisions must never be guessed:**
+  - A bare "Focus" → ask *which* Focus (Focus Plus or Focus Legacy).
+  - A bare "CM Elevate" → pinned by keywords (`_pin_cm_elevate_dataset`).
+
+  See [docs/SCHEMES.md](docs/SCHEMES.md).
+- **Match the surrounding code.** Comments explain *why*, often citing the incident and date.
+  Keep that style.
+
+## 5. AI / LLM rules
+
+- **Never trust a prose rule alone** for a wrong-number bug. The project's pattern is:
+  1. a prompt rule;
+  2. a few-shot example;
+  3. a **deterministic guard** in `execute_with_repair` or `compose_response`.
+
+  Prose rules have repeatedly failed under sampling.
+- **Model roles are fixed** (see [app/config.py](app/config.py)):
+  - `qwen-model` (30B coder) = SQL generation only;
+  - `qwen4-deploy` (4B) = classifier + SQL verifier;
+  - `qwen35-9b` = composer;
+  - embeddings = gateway `qwen3-embedding`, 1024-dim (D-067, `.env`; rollback `EMBEDDING_PROVIDER=local` +
+    `megh_scheme_kb_v3`). A different embedding model needs NEW Qdrant collections and re-tuned cut-offs;
+  - **re-ranker = gateway `qwen3-reranker`, ALWAYS ON, on every knowledge question** (D-083, user rule
+    2026-10-29). There is no on/off setting and none may be added back; the local jina re-ranker was removed.
+    If it misbehaves, fix it (call format, deployment, fusion) — never disable it.
+    `tests/test_reranker_always_on_2026_10_29.py` guards this.
+
+  Do not move roles without a DECISIONS entry.
+- The composer must never state a number that isn't in the result. The faithfulness checks in
+  `compose_response` enforce this. Don't weaken them.
+- **Few-shot examples are per scheme, ranked by IDF** (`annotations.few_shot_examples`). The
+  CM Elevate Legacy bank is `cmelevatelegacy_prompt_few_shots.yaml` (v2), not the v1 file.
+  **`SQL_EXAMPLES_SOURCE=yaml` is the default again since 2026-10-29 (D-086, user decision after the B5 measurement:
+  qdrant needed 8 repairs vs 1).** `qdrant` takes them from `megh_sql_metadata` (unvalidated, KI-438) plus its view /
+  join notes (D-074); `yaml_meaning` ranks the YAML banks by meaning (B5). Measure with the held-out set before switching.
+- **Follow-up context is structured, not sliced** (D-022). The rewrite gets the previous turn's
+  filters, and gets its result rows only when the follow-up points into them. Its output is
+  provenance-checked field by field (D-024). Do not put raw previous-answer text back into a
+  prompt.
+- **Conversation state lives in Postgres** (`app.conversations.context_state`, versioned;
+  `session_sync`, D-023). The in-process `SessionStore` is a per-worker cache. Anything the next
+  turn needs must be in `Session.to_snapshot()`.
+- **The KB is `megh_knowledge`, loaded by another pipeline and read-only to the app (D-074,
+  `QDRANT_KB_READ_ONLY=true`)**: editing `data/incoming/<scheme>/` or `POST /api/rag/reingest` no longer
+  changes RAG answers (KI-440); KB doc changes go to the loading team. With `QDRANT_KB_READ_ONLY=false`
+  (an app-owned collection) the old flow applies: re-ingest after editing `data/incoming/<scheme>/`.
+
+## 6. SQL safety and database protection
+
+- LLM SQL runs **only** through `db.run_readonly()`. It enforces a single statement, a
+  `SELECT`/`WITH` lead, no write/DDL keywords, and an auto-`LIMIT 1000`. Never bypass it. Never
+  run model text through `fetch_rows` or `execute`.
+- The app's own SQL is **always parameter-bound**.
+- **No regex anywhere, ever (D-046, D-047).** Code that reads, checks or changes SQL works on the SQLGlot tree,
+  through `app/sql_ast.py` (inspection, filters incl. `UPPER(col)` / every `IN` value, rewrites via `transform`).
+  English text uses the word matcher `app/text_match.py` or string methods; the frontend uses string methods.
+  Never write `import re`, a compiled pattern, a JS regex literal or `new RegExp`.
+- **Privacy tables must never be queried:**
+  - `curated.fact_focus_legacy_disbursement` and `curated.bridge_pg_bank_history` (unmasked
+    account numbers);
+  - `curated.fact_cm_elevate_disbursement` (applicant names).
+
+  Only the prompt protects them today; see KNOWN_ISSUES KI-004.
+- **`Focus Legacy to share to BLH.csv`** (repo root) contains **unmasked bank account numbers and
+  holder names** (KI-022). Never print, quote, copy or upload its rows. Count or aggregate them
+  only. Never commit new raw source files.
+- `app/users.yaml` holds plaintext seed passwords (KI-023). Never repeat them.
+- **Do not modify database data or schema.** `megh_db.curated` belongs to the ingestion team
+  (`megh-ingestion`). Report data defects to them as a `docs/*_DB_Issues.md` note.
+- The app **creates and migrates only the `app.*` schema** (`appdb.ensure_schema`, idempotent
+  `IF NOT EXISTS`).
+- For ad-hoc investigation against the live DB: use read-only queries only, ideally inside a
+  `READ ONLY` transaction that you roll back.
+
+## 7. Testing rules
+
+- Use the repo venv: `.venv/Scripts/python.exe` (Windows). System Python lacks `fastembed`, and
+  RAG answers silently degrade under it.
+- Run pytest on the **27 pytest-style files only**, then the **14 plain-script suites**
+  (`python tests/test_X.py`). The exact commands are in [docs/TESTING.md](docs/TESTING.md).
+  Do **not** run bare `pytest tests`: it crashes with INTERNALERROR (KNOWN_ISSUES KI-018).
+- Baseline (2026-10-03, after the all-places fixes KI-188..198): 1,453 pytest passed, 0 failed (27 files),
+  with the graph off AND on; 14/14 scripts. Live context suite 43/43 on both the sequential and the
+  LangGraph path. Live all-places bulk 30,280/30,280 (docs/SCHEMES.md "All-places QA").
+  The live multi-turn suite `tests/live_context_validation.py` (needs the VPN) passed 43/43 on
+  2026-09-26 and again on 2026-09-27 after the Focus Plus and the CM Elevate fixes. Re-run it after any routing, rewrite or state change.
+- Every bug fix gets a regression test that calls the **real function**, never a
+  re-implementation of it.
+- Some tests pin exact source strings in the pipeline (they read the pipeline files joined in
+  `_PIPELINE_FILES` order). If one fails after a refactor, read it
+  before "fixing" it.
+- **Green tests do not prove NL→SQL accuracy.** There is no golden-set benchmark. Behaviour
+  changes need a live check: call `pipeline.answer_question` in-process with the `.venv` Python,
+  from the repo root so `.env` loads. The DB and gateway require the office VPN.
+
+## 8. DOCUMENTATION MAINTENANCE IS PART OF EVERY DEVELOPMENT TASK.
+
+This rule is permanent and mandatory.
+
+**Before work:**
+1. Read this file.
+2. Read `docs/CURRENT_STATE.md`, and `docs/HANDOFF.md` if you are continuing work.
+3. Read the docs relevant to the task (see the map in §3).
+4. Check `git status` and recent commits.
+5. Inspect the actual source code, and understand existing behaviour before changing it.
+
+**During work**, keep track of:
+- architectural changes;
+- behaviour changes;
+- files changed;
+- tests run and their results;
+- newly discovered issues;
+- significant decisions.
+
+**After work:**
+1. Run the relevant tests.
+2. **Always review and update `docs/CURRENT_STATE.md` and `docs/HANDOFF.md`.**
+3. Update the other docs that the change affects:
+
+| If you changed… | Update |
+|---|---|
+| Routing, prompts, SQL gen/verify/repair, composer, RAG, models, timeouts | AI_PIPELINE.md (+ TESTING.md, KNOWN_ISSUES.md) |
+| DB objects used, joins, units, years, SQL execution | DATA_MODEL.md (+ AI_PIPELINE.md if query behaviour changed) |
+| Anything scheme-specific, or added a scheme | SCHEMES.md (+ AI_PIPELINE.md if pipeline behaviour changed) |
+| Components, API, auth, deploy, infra | ARCHITECTURE.md, PROJECT_CONTEXT.md, DECISIONS.md |
+| A significant technical choice | DECISIONS.md |
+| Test strategy or suites | TESTING.md |
+| A bug found, fixed or re-scoped | KNOWN_ISSUES.md |
+
+4. Run a consistency check: look for stale scheme counts, model roles, file names, test counts
+   and issue statuses. Mark anything you cannot resolve as
+   `DOCUMENTATION CONFLICT — NEEDS VERIFICATION`.
+5. Finish with a summary covering: WHAT CHANGED · FILES CHANGED · TESTS RUN · TEST RESULTS ·
+   DOCUMENTATION UPDATED · KNOWN ISSUES · REMAINING WORK · NEXT STEP.
+
+**Never finish a significant task with stale documentation.** Do not assume earlier conversation
+context exists: the repository must carry everything a new session, or a different Claude
+account, needs. Don't create new top-level Markdown files for project knowledge. Extend the docs
+above instead.
+
+**Labels used in docs:**
+- **VERIFIED:** read in code, config or a test run.
+- **INFERRED:** reasoned from evidence, not directly confirmed.
+- **UNKNOWN — NEEDS VERIFICATION:** could not be confirmed.
+- **PLANNED:** not implemented.
+
+## 9. Environment quick facts
+
+- Windows dev box. Run from the repo root, because `.env` is read relative to the working
+  directory.
+- Start the app: `.venv/Scripts/python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8401` — **port 8401 only,
+  for the whole project (user rule 2026-10-19); never 8400 or any other port** — then open
+  `/megh-chat` (chat), `/admin-ui` and `/health`. `/` redirects to `/megh-chat`.
+- UI work: `cd frontend && npm install && npm run dev` (hot reload on :5173, API proxied to :8401);
+  `npm run build` writes `web/app/`, which is what the app serves.
+- `megh_db` and the model gateway are on `10.48.242.4`, which needs the Fortinet VPN.
+  The DB connection sometimes times out briefly, so retry.
+- Qdrant is `http://10.48.242.4:6333` (data box, needs the VPN) since 2026-10-27 (D-074). The project uses
+  **only two collections, both READ-ONLY to the app**: `megh_knowledge` (RAG, `QDRANT_COLLECTION`,
+  `QDRANT_KB_READ_ONLY=true`) and `megh_sql_metadata` (SQL examples + view / join notes, used only with
+  `SQL_EXAMPLES_SOURCE=qdrant`; the default is `yaml` since 2026-10-29, D-086). Conversation memory is off (it needs its own collection). Never create, write or delete
+  any collection there (`Metadata_*`, `sql_examples`, `megh_scheme_kb`, ... are not ours).
+- `.env` is gitignored and holds real secrets. Never print or commit it.
