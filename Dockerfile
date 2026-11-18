@@ -1,4 +1,9 @@
-# syntax=docker/dockerfile:1
+# NO "# syntax=docker/dockerfile:1" line (removed 2026-11-18): it makes BuildKit
+# pull the docker/dockerfile frontend image from Docker Hub before anything else,
+# and on the deploy host that pull failed ("dial tcp [2600:...]:443: socket:
+# address family not supported by protocol" - registry resolved to IPv6, host has
+# none). Nothing below needs it (no RUN --mount, no heredocs); the built-in
+# frontend builds this file as-is. See deploy/DEPLOYMENT.md "Docker build fails".
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Meghalaya NL Assistant (MGNREGA + PMAY-G) — single FastAPI service (app.main:app)
