@@ -136,8 +136,10 @@ definitions:
           # Starts the app in the background; writes BASE_URL to .ci_base_url
           - bash scripts/ci/start_app.sh
           - if [ -f .ci_base_url ]; then export BASE_URL="$(cat .ci_base_url)"; fi
+          # tests/e2e ONLY: loading the whole tests/ folder imports the 14 script-style suites,
+          # which run at import (KI-018) - pipeline #5 failed there, not in a browser test.
           - >
-            python3 -m pytest -m e2e
+            python3 -m pytest tests/e2e -m e2e -p no:cacheprovider
             --browser chromium
             --screenshot only-on-failure
             --video retain-on-failure
