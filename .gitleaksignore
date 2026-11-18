@@ -1,0 +1,5 @@
+# Findings that stay in the git history and were dealt with (gitleaks reads this file).
+# tests/ui_headless/token_sa.txt: an EXPIRED login token (JWT) committed in bc4bc63 with the
+# meghoneai code. The file is deleted and ignored (2026-11-18); JWT_SECRET must be rotated on the
+# servers, because the token can be used to guess it offline.
+bc4bc63a6c0ff6c535cc33da18540c638524862d:tests/ui_headless/token_sa.txt:jwt:1

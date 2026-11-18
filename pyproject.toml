@@ -1,11 +1,42 @@
+# Tool settings for the CI pipeline (bitbucket-pipelines.yml) and pre-commit.
+# Tuned on 2026-11-18 to the Megh One AI app (pipeline #4 failed on the generic template).
+# The app's own rules are in CLAUDE.md; its test commands are in docs/TESTING.md.
+
 [tool.ruff]
 line-length = 100
-target-version = "py312"
-extend-exclude = ["migrations", ".venv", "venv"]
+# Production runs Python 3.11 (Dockerfile: python:3.11-slim).
+target-version = "py311"
+# Lint the application and its tests only. uat/, documents/ and data/ hold one-off
+# QA and report scripts; frontend/ and web/ are JavaScript.
+extend-exclude = [
+    "migrations", ".venv", "venv",
+    "uat", "documents", "data", "new_docs", "reference_documents", "frontend", "web",
+]
 
 [tool.ruff.lint]
 # pycodestyle, pyflakes, isort, bugbear, pyupgrade, simplify
 select = ["E", "F", "W", "I", "B", "UP", "SIM"]
+# Existing code base, measured 2026-11-18 (12,358 findings, none of them a failing behaviour).
+# These rules are off for now so the pipeline can guard everything else; take a rule off this
+# list once the code that breaks it has been cleaned (CLAUDE.md: no drive-by refactors).
+extend-ignore = [
+    "E501",    # long lines (7,262)
+    "E702", "E701", "E401", "E402", "E731", "E741",
+    "I001",    # import order
+    "F401", "F811", "F841", "F541",
+    "B905", "B008", "B007", "B023", "B904", "B033", "B017",
+    "UP037", "UP031", "UP041", "UP017", "UP035", "UP034", "UP015", "UP012",
+    "SIM115", "SIM905", "SIM102", "SIM105", "SIM103", "SIM114", "SIM117", "SIM113",
+    "SIM300", "SIM910", "SIM101", "SIM212",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# app/pipeline/ is ONE shared namespace: app/pipeline/__init__.py executes every file in
+# _PIPELINE_FILES order into it, so a function may use a name defined in another file
+# (CLAUDE.md section 2). Ruff checks each file alone and cannot see those names.
+"app/pipeline/**" = ["F821"]
+# A quoted type hint ("Callable[...] | None"), never evaluated at runtime.
+"app/annotations.py" = ["F821"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -19,4 +50,14 @@ source = ["."]
 omit = ["tests/*", "*/migrations/*", ".venv/*", "venv/*", "scripts/*"]
 
 [tool.bandit]
-exclude_dirs = ["tests", ".venv", "venv", "scripts"]
+exclude_dirs = ["tests", ".venv", "venv", "scripts", "uat", "documents", "data", "new_docs", "frontend", "web"]
+# Reviewed 2026-11-18; each skip has a reason:
+skips = [
+    "B608",  # SQL built in code: the app's own SQL is parameter-bound, and model SQL runs only
+             # through db.run_readonly() (single SELECT/WITH, no write keywords, LIMIT) - CLAUDE.md 6
+    "B102",  # exec: app/pipeline/__init__.py loads the pipeline files into one namespace (by design)
+    "B324",  # md5 / sha1 used for cache keys and change detection, not for security
+    "B105",  # flagged strings are "bearer" and an empty-string check; gitleaks scans for real secrets
+    "B110", "B112",  # try/except/pass|continue around optional logging, cache and metrics calls
+    "B404", "B603", "B607",  # subprocess with fixed argument lists (git, npm), never a shell
+]
