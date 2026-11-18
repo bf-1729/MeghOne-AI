@@ -1,0 +1,213 @@
+{
+ "when": "2026-10-26T16:01:53",
+ "files": {
+  "data/mgnrega/few_shot.yaml": {
+   "scheme": "MGNREGA",
+   "examples": 78,
+   "counts": {
+    "ok": 77,
+    "empty": 1
+   },
+   "all_pass": true,
+   "failing_in_prompt": 0,
+   "failing": []
+  },
+  "data/pmay/pmay_few_shot.yaml": {
+   "scheme": "PMAY-G",
+   "examples": 66,
+   "counts": {
+    "ok": 64,
+    "empty": 2
+   },
+   "all_pass": true,
+   "failing_in_prompt": 0,
+   "failing": []
+  },
+  "data/focus_plus/focusplus_few_shot.yaml": {
+   "scheme": "Focus Plus",
+   "examples": 91,
+   "counts": {
+    "ok": 88,
+    "empty": 2,
+    "blocked": 1
+   },
+   "all_pass": false,
+   "failing_in_prompt": 0,
+   "failing": [
+    {
+     "index": 86,
+     "key": "sql",
+     "question": "Have the Focus Plus totals been verified?",
+     "outcome": "blocked",
+     "detail": "query reads meta.v_reconciliation_focus_plus — only the curated / semantic schemas are allowed",
+     "in_prompt": false
+    }
+   ]
+  },
+  "data/cm_elevate/cmelevate_few_shot.yaml": {
+   "scheme": "CM Elevate",
+   "examples": 128,
+   "counts": {
+    "ok": 115,
+    "error": 11,
+    "blocked": 2
+   },
+   "all_pass": false,
+   "failing_in_prompt": 0,
+   "failing": [
+    {
+     "index": 97,
+     "key": "sql",
+     "question": "What is the gender split of CM Elevate applicants?",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 98,
+     "key": "sql",
+     "question": "How many women applied to CM Elevate?",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 99,
+     "key": "sql",
+     "question": "Gender split by scheme",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 100,
+     "key": "sql",
+     "question": "Gender split by district",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 101,
+     "key": "sql",
+     "question": "Which schemes are majority female?",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 102,
+     "key": "sql",
+     "question": "Gender split by application mode",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 103,
+     "key": "sql",
+     "question": "What extra fields does the Warehouse scheme record?",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 108,
+     "key": "sql",
+     "question": "How many scheme-specific fields does each scheme record?",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 109,
+     "key": "sql",
+     "question": "Read a scheme-specific field (occupation) for the Piggery scheme",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 110,
+     "key": "sql",
+     "question": "Find applications with a specific scheme-specific value",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for table fact_cm_elevate_application",
+     "in_prompt": false
+    },
+    {
+     "index": 111,
+     "key": "sql",
+     "question": "Which scheme-specific fields are common to every scheme?",
+     "outcome": "error",
+     "detail": "InsufficientPrivilegeError: permission denied for view v_cm_elevate",
+     "in_prompt": false
+    },
+    {
+     "index": 123,
+     "key": "sql",
+     "question": "Check that CM Elevate loaded completely",
+     "outcome": "blocked",
+     "detail": "query reads meta.v_reconciliation_cm_elevate — only the curated / semantic schemas are allowed",
+     "in_prompt": false
+    },
+    {
+     "index": 124,
+     "key": "sql",
+     "question": "How many CM Elevate rows were quarantined?",
+     "outcome": "blocked",
+     "detail": "query reads staging.quarantine — only the curated / semantic schemas are allowed",
+     "in_prompt": false
+    }
+   ]
+  },
+  "data/focus_legacy/focuslegacy_few_shot.yaml": {
+   "scheme": "Focus Legacy",
+   "examples": 86,
+   "counts": {
+    "ok": 80,
+    "empty": 3,
+    "blocked": 3
+   },
+   "all_pass": false,
+   "failing_in_prompt": 0,
+   "failing": [
+    {
+     "index": 72,
+     "key": "sql",
+     "question": "Did the Focus Legacy load lose any rows?",
+     "outcome": "blocked",
+     "detail": "query reads meta.v_reconciliation_focus_legacy — only the curated / semantic schemas are allowed",
+     "in_prompt": false
+    },
+    {
+     "index": 73,
+     "key": "sql",
+     "question": "Why is the database total lower than my spreadsheet?",
+     "outcome": "blocked",
+     "detail": "query reads staging.quarantine — only the curated / semantic schemas are allowed",
+     "in_prompt": false
+    },
+    {
+     "index": 74,
+     "key": "sql",
+     "question": "When was Focus Legacy last loaded?",
+     "outcome": "blocked",
+     "detail": "query reads meta.ingestion_audit — only the curated / semantic schemas are allowed",
+     "in_prompt": false
+    }
+   ]
+  },
+  "data/cm_elevate_legacy/cmelevatelegacy_prompt_few_shots.yaml": {
+   "scheme": "CM Elevate Legacy",
+   "examples": 121,
+   "counts": {
+    "ok": 120,
+    "empty": 1
+   },
+   "all_pass": true,
+   "failing_in_prompt": 0,
+   "failing": []
+  }
+ }
+}

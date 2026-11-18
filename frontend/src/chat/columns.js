@@ -1,0 +1,381 @@
+/* What each result column IS, decided once for the charts and the tables
+   (user report 2026-10-28: "How have MGNREGA person-days changed over the last
+   three years?" drew a 3×3 grid of dashes — year_key and financial_year read as
+   two dimensions — with raw cells beside formatted totals and database names as
+   headers). Presentation only: the rows themselves, and the Excel download, are
+   never changed. Read on words and characters, no regex (D-047). */
+
+import { hasSegment, isPeriodLabel, isPlainNumber, splitSpaces, isAsciiLetter, isDigit } from './text.js';
+import { MEASURE_KINDS } from './measureKinds.js';
+
+// A column is a MEASURE only if every value is a plain number. parseFloat() is
+// too lenient: parseFloat("2017-08-01") === 2017 would chart a date column.
+export const isNumeric = (v) => v !== null && v !== '' && v !== undefined
+  && (isPlainNumber(String(v).trim()) || isIndianGrouped(String(v).trim()));
+
+/** "2,72,64,054": Indian grouping (the last group 3 digits, the ones before it 2),
+    sent pre-formatted by some paths (audit 2026-10-29, X-7). */
+export function isIndianGrouped(s) {
+  const t = s.startsWith('-') ? s.slice(1) : s;
+  const [whole, frac, more] = t.split('.');
+  if (more !== undefined || (frac !== undefined && (!frac.length || !Array.from(frac).every(isDigit)))) return false;
+  const g = whole.split(',');
+  if (g.length < 3 || !Array.from(whole.replaceAll(',', '')).every(isDigit)) return false;
+  return g[0].length >= 1 && g[0].length <= 2 && g.slice(1, -1).every((x) => x.length === 2) && g[g.length - 1].length === 3;
+}
+// Numbers that are labels, not measures: year_key 2024, an LGD code, an id.
+// Kept in step with pipeline._CHART_LABEL_COL.
+export const LABEL_WORDS = ['year', 'yr', 'fy', 'code', 'id', 'lgd', 'pin', 'pincode', 'key', 'rank', 'sl', 'serial',
+  'month', 'quarter', 'week'];
+// X-12 (audit 2026-10-29): a label word anywhere in the name made the column a
+// label, so "houses_per_year", "person_days_this_year", "beneficiary_key_count",
+// "pin_count" were never charted and shown raw. A label word marks a label only
+// when it is the whole name, its end ("year_key", "district_code", "financial_year",
+// "month_num", "financial_year_short"), and never after "per" or in a name that
+// starts or ends like a measure. C-8: month / quarter / week numbers are labels.
+const LABEL_ENDS = ['key', 'code', 'id', 'short', 'num', 'no', 'name', 'label', 'lgd'];
+const LABEL_LEADS = ['financial', 'fiscal', 'calendar', 'lgd', 'village', 'block', 'district', 'gp', 'scheme', 'fy',
+  'month', 'year', 'state', 'ac', 'constituency'];
+const MEASURE_LEADS = ['avg', 'average', 'total', 'count', 'sum', 'mean', 'num', 'number', 'no', 'max', 'min'];
+const MEASURE_ENDS = ['count', 'score', 'total', 'sum', 'days', 'amount', 'value'];
+export const isLabelCol = (k) => {
+  const parts = String(k).toLowerCase().split('_').filter(Boolean);
+  if (!parts.length || parts.includes('per')) return false;
+  if (parts.length > 1 && (MEASURE_LEADS.includes(parts[0]) || MEASURE_ENDS.includes(parts[parts.length - 1]))) return false;
+  const last = parts[parts.length - 1];
+  if (LABEL_WORDS.includes(last)) return parts.length <= 2 || LABEL_LEADS.includes(parts[parts.length - 2]);
+  return parts.some((p) => LABEL_WORDS.includes(p)) && LABEL_ENDS.includes(last);
+};
+export const PERIOD_WORDS = ['year', 'yr', 'fy', 'month', 'period', 'date', 'quarter'];
+
+/** Every column any row carries, in first-seen order. A cross-scheme figures
+    table (app/cross_figures.py) can give a scheme a column the others lack, so
+    the first row's keys alone would drop it from the table and the export (2026-10-22). */
+export function tableColumns(data) {
+  const cols = [];
+  for (const r of data || []) for (const c of Object.keys(r || {})) if (!cols.includes(c)) cols.push(c);
+  return cols;
+}
+
+// X-6: "N/A", "-" among numbers are blanks, not text that stops the column being charted
+export const isBlank = (v) => {
+  if (v === null || v === undefined) return true;
+  const s = String(v).trim().toLowerCase();
+  return ['', 'none', 'null', 'nan', 'n/a', 'na', '-', '–', '—'].includes(s);
+};
+
+/** A measure column: not a label word, and every value it has is a plain number. */
+export function isMeasureCol(data, c) {
+  if (isLabelCol(c)) return false;
+  let seen = false;
+  for (const r of data || []) {
+    const v = r ? r[c] : undefined;
+    if (isBlank(v)) continue;
+    if (!isNumeric(v)) return false;
+    seen = true;
+  }
+  return seen;
+}
+
+// ── Twin columns ────────────────────────────────────────────────────────────
+// Two label columns that are one thing written two ways: year_key 2023 and
+// financial_year "2023-2024", a village name and its code. Merged ONLY when the
+// data pairs their values one-to-one, and only for a period pair or a name /
+// identifier pair — two names (block and district) are never merged, even when
+// each block happens to sit in its own district.
+const ID_WORDS = ['key', 'code', 'id', 'sl', 'serial'];
+const isIntegerish = (v) => isNumeric(v) && !String(v).includes('.');
+const allValues = (data, c) => data.map((r) => (r ? r[c] : undefined));
+const isPeriodCol = (data, c) => hasSegment(c, PERIOD_WORDS) || allValues(data, c).every((v) => isPeriodLabel(v));
+const isIdCol = (data, c) => hasSegment(c, ID_WORDS) || allValues(data, c).every(isIntegerish);
+
+function oneToOne(data, a, b) {
+  const ab = new Map();
+  const ba = new Map();
+  for (const r of data) {
+    const x = String(r[a]);
+    const y = String(r[b]);
+    if (ab.has(x) && ab.get(x) !== y) return false;
+    if (ba.has(y) && ba.get(y) !== x) return false;
+    ab.set(x, y);
+    ba.set(y, x);
+  }
+  return true;
+}
+
+/** { hiddenColumn: keptColumn } for every twin pair in the rows. The kept one is
+    the readable one: text over a number, the shorter period form ("2023-24")
+    over the longer. Empty for one row or none. */
+export function twinColumns(data) {
+  const out = {};
+  if (!Array.isArray(data) || data.length < 2) return out;
+  // A rank / serial number pairs one-to-one with the names too, but it is the
+  // ranking itself: never hidden as a twin (audit 2026-10-29, E-2).
+  const cols = tableColumns(data).filter((c) => !isMeasureCol(data, c)
+    && !hasSegment(c, ['rank', 'sl', 'serial'])
+    && data.every((r) => r && !isBlank(r[c]))
+    && new Set(allValues(data, c).map(String)).size >= 2);
+  for (let i = 0; i < cols.length; i++) {
+    for (let j = i + 1; j < cols.length; j++) {
+      const a = cols[i];
+      const b = cols[j];
+      if (a in out || b in out || !oneToOne(data, a, b)) continue;
+      const periods = isPeriodCol(data, a) && isPeriodCol(data, b);
+      const idA = isIdCol(data, a);
+      const idB = isIdCol(data, b);
+      if (!periods && idA === idB) continue;                 // two names, or two ids: not twins
+      let hide;
+      if (idA !== idB) hide = idA ? a : b;                     // keep the name, hide the id
+      else {
+        const len = (c) => Math.max(...allValues(data, c).map((v) => String(v).length));
+        hide = len(a) > len(b) ? a : b;                        // "2023-2024" hidden, "2023-24" kept
+      }
+      out[hide] = hide === a ? b : a;
+    }
+  }
+  return out;
+}
+
+// ── One financial-year column (audit 2026-10-29, A-1 / A-8) ─────────────────
+// Rows merged from several schemes name their year their own way (MGNREGA
+// year_key 2023, PMAY-G financial_year_short "2023-24"), so no year column was in
+// every row and the chart fell back to the scheme alone: a donut of "MGNREGA,
+// MGNREGA, MGNREGA, PMAY-G …" with no year anywhere. A lone year_key showed as
+// "2022, 2023" titled "Year key".
+
+/** "2023-24" for a financial-year value (2023, "2023", "2023-2024", "FY 2023-24",
+    "2023-24"); null when the value is not one. */
+export function fyLabel(v) {
+  if (v === null || v === undefined) return null;
+  let s = String(v).trim();
+  if (s.slice(0, 2).toLowerCase() === 'fy') s = s.slice(2).trim();
+  const head = s.slice(0, 4);
+  const rest = s.slice(4);
+  if (head.length !== 4 || !Array.from(head).every(isDigit) || !['19', '20'].includes(head.slice(0, 2))) return null;
+  const tail = rest.slice(1);
+  if (rest !== '' && !(rest[0] === '-' && (tail.length === 2 || tail.length === 4) && Array.from(tail).every(isDigit))) return null;
+  const y = Number(head);
+  return `${y}-${String((y + 1) % 100).padStart(2, '0')}`;
+}
+
+const isFyCol = (c) => (hasSegment(c, ['year', 'yr', 'fy', 'financial']))
+  && !hasSegment(c, ['month', 'date', 'quarter', 'week', 'day']);
+
+/** The rows with every financial-year column folded into one `financial_year`
+    ("2023-24") when rows carry different year columns, or the only one is a
+    year_key; otherwise the rows as they are. */
+export function unifyPeriods(data) {
+  if (!Array.isArray(data) || !data.length) return data;
+  const cols = tableColumns(data).filter((c) => isFyCol(c)
+    && data.some((r) => r && !isBlank(r[c]))
+    && data.every((r) => !r || isBlank(r[c]) || fyLabel(r[c]) !== null));
+  if (!cols.length) return data;
+  const differs = cols.length >= 2 && data.some((r) => cols.some((c) => !r || isBlank(r[c])));
+  const keyOnly = cols.length === 1 && hasSegment(cols[0], ['key']);
+  if (!differs && !keyOnly) return data;
+  return data.map((r) => {
+    const o = {};
+    const fy = cols.map((c) => fyLabel(r && r[c])).find((x) => x) || null;
+    for (const [k, v] of Object.entries(r || {})) {
+      if (cols.includes(k)) {
+        if (!('financial_year' in o)) o.financial_year = fy;
+        continue;
+      }
+      o[k] = v;
+    }
+    if (!('financial_year' in o)) o.financial_year = fy;
+    return o;
+  });
+}
+
+/** The rows without their hidden twin columns (new objects; the input is untouched). */
+export function withoutTwins(data) {
+  const hidden = Object.keys(twinColumns(data));
+  if (!hidden.length) return data;
+  return data.map((r) => {
+    const o = {};
+    for (const [k, v] of Object.entries(r || {})) if (!hidden.includes(k)) o[k] = v;
+    return o;
+  });
+}
+
+// ── Names and units ─────────────────────────────────────────────────────────
+// A column name as words: "total_exp_lakh" -> "total expenditure (₹ lakh)",
+// "lgd_district" -> "district". Codes in names are spelled out; the rest only
+// loses its underscores.
+const COL_WORDS = { lgd: '', exp: 'expenditure', amt: 'amount', cnt: 'count', qty: 'quantity', hh: 'households',
+  lakh: '(₹ lakh)', lakhs: '(₹ lakh)', cr: '(₹ crore)', crore: '(₹ crore)', rupees: '(₹)', rs: '(₹)', fy: 'FY',
+  pct: '%', perc: '%', avg: 'average', yr: 'year' };
+export const humanCol = (c) => String(c).split('_').map((w) => (w.toLowerCase() in COL_WORDS ? COL_WORDS[w.toLowerCase()] : w))
+  .filter(Boolean).join(' ') || String(c);
+
+// Browser run 2026-10-29: a compare card showed "₹1,066.7 crore" under the label
+// "total expenditure (₹ lakh)" — the card converts the unit, so its label names the
+// measure only and the value carries the unit.
+const MONEY_UNIT_PARTS = ['lakh', 'lakhs', 'crore', 'crores', 'cr', 'rs', 'rupees', 'inr'];
+export const measureName = (c) => humanCol(String(c).split('_')
+  .filter((w) => !MONEY_UNIT_PARTS.includes(w.toLowerCase())).join('_') || String(c));
+
+/** A heading for a table or an axis: humanCol, without "raw", first letter capitalised. */
+export function colTitle(c) {
+  const words = humanCol(c).split(' ').filter((w) => w && w.toLowerCase() !== 'raw');
+  const s = words.join(' ') || String(c);
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** 'lakh' | 'crore' | 'rupees' | 'pct' | null — from the parts of the column name
+    ('_', spaces, "(%)", "(Rs)": D-2), as the backend's _unit_suffix. A rate, share
+    or ratio is a % (D-6), except a wage rate, which is money. */
+export function unitOf(c) {
+  const p = nameParts(c);
+  const has = (ws) => p.some((x) => ws.includes(x));
+  if (has(['lakh', 'lakhs'])) return 'lakh';
+  if (has(['cr', 'crore', 'crores'])) return 'crore';
+  if (has(['pct', 'percent', 'percentage', 'perc', '%'])) return 'pct';
+  if (has(['rs', 'rupees', 'inr', '₹'])) return 'rupees';
+  if (has(['share', 'ratio', 'participation']) || (has(['rate']) && !has(['wage', 'wages', 'per']))) return 'pct';
+  return null;
+}
+
+/** A % column whose values are fractions (0.753 for 75.3%): read ×100 (D-6). */
+export function fractionPct(c, values) {
+  if (unitOf(c) !== 'pct' || nameParts(c).some((x) => ['pct', 'percent', 'percentage', 'perc', '%'].includes(x))) return false;
+  const nums = values.filter((v) => Number.isFinite(v));
+  return nums.length > 0 && nums.every((v) => v >= 0 && v <= 1) && nums.some((v) => v > 0 && v < 1);
+}
+
+// D-5 / D-12: measures where less is better — the "ahead" side and the highlight flip.
+const LOWER_BETTER = ['pending', 'delay', 'delays', 'delayed', 'unpaid', 'outstanding', 'backlog', 'overdue', 'rejected',
+  'incomplete', 'arrears', 'dues'];
+export const lowerIsBetter = (c) => nameParts(c).some((x) => LOWER_BETTER.includes(x));
+
+// Measures that must not be added up across rows: shares, rates, averages, and a
+// running stock (MGNREGA job cards are cumulative; adding years is wrong).
+const NON_ADDITIVE = ['pct', 'percent', 'percentage', 'perc', 'share', 'rate', 'ratio', 'avg', 'average', 'mean',
+  'median', 'per', 'cumulative', 'card', 'cards', 'min', 'max', 'minimum', 'maximum'];
+export const isAdditive = (c) => !hasSegment(c, NON_ADDITIVE) && measureKind(c) !== 'rate';
+
+// ── What may be added up, and along which dimension (audit 2026-10-29, G) ──────
+// The UI added any number column it could: the donut's centre "Total", the
+// "% of the total", the pivot's Total row and column and the top of a stacked
+// bar. Villages, households and beneficiaries overlap — the same village is in
+// MGNREGA and in PMAY-G, and in 2023-24 and again in 2024-25 — so "Total 11,000"
+// villages showed for a state of about 7,000. The kind of a measure decides:
+//   flow (money, person days)   adds across places and years
+//   distinct (villages, people) adds across places only
+//   stock (job cards)           adds across places only
+//   rate (%, average)           never adds
+// and nothing adds across schemes (they count and spend different things).
+
+/** The '_' / space separated parts of a column name, lower case, "(%)" -> "%". */
+export function nameParts(c) {
+  return String(c).toLowerCase().split('').map((ch) => ('_ ()[]/-'.includes(ch) ? ' ' : ch)).join('')
+    .split(' ').filter(Boolean).flatMap((p) => (p.length > 1 && p.endsWith('%') ? [p.slice(0, -1), '%'] : [p]));
+}
+
+/** 'rate' | 'stock' | 'flow' | 'distinct' (measureKinds.js; anything else is a flow). */
+export function measureKind(c) {
+  const parts = nameParts(c);
+  for (const kind of ['rate', 'stock', 'flow', 'distinct']) {
+    if (parts.some((p) => MEASURE_KINDS[kind].includes(p))) return kind;
+  }
+  return 'flow';
+}
+
+const SCHEME_WORDS = ['scheme', 'schemes'];
+/** 'scheme' | 'period' | 'place' — what a label column of these rows is. */
+export function dimOf(c, data) {
+  if (hasSegment(c, SCHEME_WORDS)) return 'scheme';
+  if (hasSegment(c, PERIOD_WORDS) || (Array.isArray(data) && data.length
+    && data.every((r) => r && (isBlank(r[c]) || isPeriodLabel(r[c]))))) return 'period';
+  return 'place';
+}
+
+/** May measure `c` be added up across the values of a `dim` dimension? */
+export function canAdd(c, dim) {
+  const kind = measureKind(c);
+  if (kind === 'rate' || dim === 'scheme') return false;
+  if (dim === 'period') return kind === 'flow';
+  return true;
+}
+
+// ── Cell formatting ─────────────────────────────────────────────────────────
+const NUM = new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 });
+
+/** One table cell as shown: a measure with Indian grouping and at most 2
+    decimals (27264054 -> 2,72,64,054; 119.73925 -> 119.74); a label — a year, a
+    code, an id — exactly as it is (2023 never becomes 2,023); a missing value "—". */
+// C-5 (audit 2026-10-29): one path returns "EAST KHASI HILLS", another "East Khasi
+// Hills"; a place name in capitals is shown in Title Case (the rows are unchanged).
+const PLACE_PARTS = ['district', 'block', 'village', 'constituency', 'panchayat', 'gp', 'ac'];
+export function placeTitle(v, col) {
+  const s = String(v);
+  if (!nameParts(col).some((p) => PLACE_PARTS.includes(p)) || s !== s.toUpperCase() || s === s.toLowerCase()) return s;
+  return s.toLowerCase().split(' ').map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(' ');
+}
+
+export function formatCell(v, col) {
+  if (isBlank(v)) return '—';
+  if (!isNumeric(v)) return placeTitle(v, col);
+  if (isLabelCol(col)) return String(v);
+  // An identifier written in digits is shown as stored: a leading zero ("0012")
+  // or 13+ digits (an account / sanction number) is never a quantity.
+  const s = String(v).trim();
+  const digits = s.startsWith('-') ? s.slice(1) : s;
+  if ((digits.length > 1 && digits[0] === '0' && digits[1] !== '.') || digits.split('.')[0].length >= 13) return s;
+  const n = Number(s.replaceAll(',', ''));
+  if (!Number.isFinite(n)) return String(v);
+  // X-13: ₹ 0.004 crore (₹ 40,000) showed as "0"; below 0.01 of the unit the
+  // smaller unit is shown instead
+  const unit = unitOf(col);
+  if ((unit === 'crore' || unit === 'lakh') && n !== 0 && Math.abs(n) < 0.01) {
+    return `₹${NUM.format(n * (unit === 'crore' ? 1e7 : 1e5))}`;
+  }
+  return NUM.format(n);
+}
+
+const signed = (n) => (n > 0 ? '+' : n < 0 ? '−' : '') + NUM.format(Math.abs(n));
+
+/** "Change from previous" for a period table: { column, values } or null.
+    Only for one period column + one measure, periods already in time order,
+    2+ rows — the figures come from the rows, nothing else. */
+export function changeColumn(data) {
+  if (!Array.isArray(data) || data.length < 2) return null;
+  const cols = tableColumns(data);
+  const measures = cols.filter((c) => isMeasureCol(data, c));
+  const labels = cols.filter((c) => !measures.includes(c));
+  if (measures.length !== 1 || labels.length !== 1) return null;
+  const [m] = measures;
+  const [p] = labels;
+  if (!data.every((r) => isPeriodLabel(r[p]))) return null;
+  for (let i = 1; i < data.length; i++) {
+    if (String(data[i - 1][p]).localeCompare(String(data[i][p])) >= 0) return null;   // not in time order
+  }
+  const pct = unitOf(m) === 'pct';
+  const values = data.map((r, i) => {
+    if (i === 0 || !isNumeric(r[m]) || !isNumeric(data[i - 1][m])) return '';
+    const cur = Number(String(r[m]).replaceAll(',', ''));
+    const prev = Number(String(data[i - 1][m]).replaceAll(',', ''));
+    const d = cur - prev;
+    if (pct) return `${signed(d)} pts`;
+    return prev ? `${signed(d)} (${signed(Math.round((d / prev) * 1000) / 10)}%)` : signed(d);
+  });
+  return { column: 'Change from previous', values };
+}
+
+// ── Question words ──────────────────────────────────────────────────────────
+const words = (s) => splitSpaces(String(s || '').toLowerCase())
+  .map((w) => w.split('').filter((c) => isAsciiLetter(c) || isDigit(c) || c === '-').join(''))
+  .filter(Boolean);
+const CHANGE_WORDS = ['change', 'changed', 'changes', 'changing', 'trend', 'trends', 'grow', 'grew', 'growth',
+  'grown', 'rise', 'rose', 'risen', 'fall', 'fell', 'fallen', 'increase', 'increased', 'decrease', 'decreased',
+  'decline', 'declined', 'yoy'];
+
+/** The question asks how a figure moved over time ("how have … changed",
+    "trend", "over the years", "year on year"). */
+export function asksChange(question) {
+  const w = words(question);
+  if (w.some((x) => CHANGE_WORDS.includes(x))) return true;
+  const has3 = (a, b, c) => w.some((x, i) => x === a && w[i + 1] === b && w[i + 2] === c);
+  return has3('over', 'the', 'years') || has3('year', 'on', 'year') || w.includes('year-on-year');
+}
