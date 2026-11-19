@@ -735,6 +735,10 @@ the rewrites and before it runs (`_repaired_sql_denial`; D-033, KI-183). A denia
 - `_focusplus_drop_unrequested_verification_status`
 - `_cm_legacy_keep_unresolved_off_village` (CM Elevate Legacy, Focus Legacy and, since
   2026-09-27, CM Elevate: KI-068)
+  - since 2026-11-19 (KI-697): when the SQL counts villages BESIDE other totals (village columns only inside
+    aggregates, at least one other aggregate, one plain SELECT), `_unresolved_into_village_aggregates` moves
+    `entity_type <> 'Unresolved'` from WHERE onto the village aggregates as `FILTER (WHERE ...)` instead of
+    leaving it to cut every total; village lists and pure village counts keep the WHERE filter
 - **CM Elevate only (2026-09-27, use-case QA, KI-069 / 070 / 072 / 074):**
   - `_cm_elevate_split_scheme_in_list`: a `scheme_name IN (…)` with 2+ programmes and no
     `GROUP BY scheme_name` gets `scheme_name` added to the SELECT and the GROUP BY. The IN list is
@@ -936,7 +940,8 @@ Legacy's were).
      summed rounded rows wrongly. The subsidy/loan note now depends on the columns present
      (KI-176: told to "give all three" with only a total, the composer invented a split);
    - Focus Legacy: `_focus_legacy_answer_notes`, and `_focus_legacy_list_total`, which gives the
-     true count of a truncated list; `_focus_legacy_unplaced_row` (KI-145), which re-runs a
+     true count of a truncated list; since 2026-11-19 (KI-694) `_focus_legacy_list_sums` adds the money of the
+     WHOLE result to that count line (the query without its LIMIT; money columns found by `_c13_money_units`); `_focus_legacy_unplaced_row` (KI-145), which re-runs a
      per-place breakdown without the model's `IS NOT NULL` filter to read the records that have
      no block / village / constituency. A one-place-column breakdown is then written by
      `_focus_legacy_breakdown_answer` and the composer is skipped (D-031, KI-150);
@@ -985,6 +990,9 @@ Legacy's were).
          allowed set. They are the filter's labels. "…under the 12.5K batch" had been flagged
          as a misquote ("12.5"), and the fallback printed "31,317,500 amount raw.".
      - On failure → **one strict retry (9B)** → then `_deterministic_answer`.
+       The retry prompt lists the values under readable labels (`_human_metric`), never raw column names, and a
+       retry that still writes a raw result column name (`_c13_raw_column_named`) falls back like any other
+       failed retry (KI-696, 2026-11-19).
    - **Hedge guard:** if the answer hedges ("not covered", "no data") over a real non-zero value
      → `_deterministic_answer` or `_deterministic_list_answer`.
 3. **Post-composition guarantees:**
@@ -1063,6 +1071,11 @@ Key points (same day): `compose_response` passes `sql=sql` to `_framed_fallback`
 answer then reads head line, `**Key points**` (`_c12_key_points` over `_c12s_rollup_split(sql, rows)[0]`: total, spread,
 most, highest — computed by code, money through `_c12_money`), `**Details**`, then the list. No `sql` (cross-scheme
 per-scheme lines, `_is_fallback_answer`, single-row) = unchanged. Any exception in the key points leaves the plain list.
+Since 2026-11-19 (KI-686 / KI-694 / KI-696): the item a row IS is the label column that names every row once
+(normally the last; "pg_name, lgd_district" -> groups, the district an attribute), or plain "rows" when none
+does; a list that hit its own LIMIT is headed `**Key points (the N rows shown)**`. The hedge guard passes `sql` too,
+and a single-row figure the SQL takes as MAX / MIN (`_c12_extreme_value_col`) reads "the group size is 190",
+not "the recorded total is 190 group size"; `_is_fallback_answer(..., sql=)` recognises both forms.
 
 ### 2.9b' CM Elevate dataset choice (2026-11-03, D-099)
 Context stage: `_pin_cm_elevate_dataset(question, _cm_thread_scheme(...))` writes the chat's CM Elevate dataset into a
@@ -1146,6 +1159,8 @@ Three parts, all in `compose_response` and the c12 files:
    ROLLUP total rows, no usable value. Other notes and the style shots go to / do not block the opening line. With the
    templates on, `_shaped_fallback` returns the templated answer under code's opening line. Log line:
    `compose_response: templated <kind> answer`.
+
+- **2026-11-19 (CM Elevate Legacy sheet, KI-687..691):** (1) a trend leads with the measure the question names (`_c12s_asked_metric`; only when the first column shares no word with the question and exactly one other column scores 2+), and its extras follow the question; (2) a period label with no digit ("(no financial year)") is not a period (`_c12s_time_order`): never the start of "fell from / rose from", listed last; (3) `_c12_money` keeps a small ROUNDed crore figure in crore (lakh columns unchanged: a stored unit) ("₹0.07 crore", never a made-up "₹7,00,000"); (4) `compose_response(exact_rows=)`: CM Elevate Legacy hands the same rows unrounded (`_cm_legacy_unrounded_rows`, one extra read-only query), and the code-written lines use them, so a list total is the true total (₹82.90, not the rounded-row sum ₹82.89) and ₹26,000 is not "₹0". Breakdown / ranking measure choice is unchanged (TC-36's order by applications).
 
 ### 2.9e RAG fix report fixes (2026-10-29, D-089..D-091, KI-574..KI-590; LIVE-VERIFIED in-process)
 The tester's report (`megh_rag_fix_report.md`, 17 issues) and where each fix lives — all in stage functions or the
@@ -1500,6 +1515,8 @@ through the same function.
    - **Deterministic backstops:** `ground_answer` (word/number support rescue; a number in neither the passages
      nor the question — digits or spelt out — is dropped; never empties the answer; no sentence split after an
      initial); after composing `_with_faq_facts`, `_with_related_ministry`, `_with_subscheme_count`.
+     `_with_faq_facts` skips fragments of under 3 words and questions, and `_rag_drop_question_heading` also drops
+     a numbered FAQ question line ("4. What is a PG?"), as megh_knowledge stores them (KI-695, 2026-11-19).
    - **Citations:** `_supporting_chunks` (pieces the sentences lean on). **Next steps:** the last chip after a
      knowledge answer is `followups._KNOWLEDGE_DATA_NEXT[scheme]` (each routes DATA, tested live).
    - Tests: `tests/test_knowledge_routing_2026_10_29.py` (offline), `tests/live_chat_knowledge.py` (live, VPN).
@@ -1794,6 +1811,8 @@ from `session.turn_context`. Each field gets a `{value, source, confidence, turn
 - **name:** a capitalised word found in text the rewrite was *not* allowed to use (the previous
   answer, or the summary and older turns without a back-reference) and in no permitted source.
   This is how villages are covered offline.
+
+- **Breakdown kept (2026-11-19, KI-692):** a rewrite that drops a breakdown the user typed (`_c02_breakdowns`: "across schemes", "each district", "block-wise") is a provenance violation (`_c01_dropped_breakdown`, violation `breakdown`) -> the original question goes on.
 
 ### 5.5 Shared conversation state across workers (VERIFIED offline, 2026-09-26; KI-028)
 

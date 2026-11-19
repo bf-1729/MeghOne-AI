@@ -115,6 +115,7 @@ class MeghalayaGraphState(TypedDict, total=False):
     fl_total: Any
     fl_unplaced: Any
     fl_breakdown: str | None
+    exact_rows: list | None           # CM Elevate Legacy rows unrounded, for code-written figures (KI-689)
     answer: str | None
     cross: dict | None                # cross-scheme comparison: {schemes, text} (app/cross_scheme.py)
     # ── outcome ──
@@ -134,7 +135,7 @@ _DATA_KEY = {"question": "data_question", "skip_scope_clarify": "scope_resumed",
              "village_hint": "data_village_hint"}
 _DATA_KEYS = ("question", "skip_scope_clarify", "prior_resolved", "village_hint", "schemes",
               "fp_amount", "entity_result", "mg_admin", "mg_women", "mg_det", "per_scheme", "sql", "rows", "notes",
-              "style", "fl_total", "fl_unplaced", "fl_breakdown", "answer", "cross",
+              "style", "fl_total", "fl_unplaced", "fl_breakdown", "exact_rows", "answer", "cross",
               "pre_rephrase_question")
 # Read by the data stages but owned by the turn stages: never written back.
 _DATA_READ_ONLY = ("skip_scope_clarify", "prior_resolved", "pre_rephrase_question")

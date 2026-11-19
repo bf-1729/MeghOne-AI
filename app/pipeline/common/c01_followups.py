@@ -2020,6 +2020,8 @@ async def rewrite_followup(question: str, prev: "object", extra_context: str = "
                 violation = "measure"
             if not violation and settings.PLACE_GAZETTEER and _c01_kept_finer_place(question, prev, out):
                 violation = "place"
+            if not violation and _c01_dropped_breakdown(question, out):
+                violation = "breakdown"
             guard = f"rejected:{violation}" if violation else "ok"
             if violation:
                 # The model put a scheme/district/block into the question that
@@ -2052,6 +2054,16 @@ async def rewrite_followup(question: str, prev: "object", extra_context: str = "
             context_budget.log_prompt_context("rewrite", sections, tiers=tiers, guard=guard,
                                               followup_kind=kind)
     return question
+
+
+def _c01_dropped_breakdown(question: str, rewritten: str) -> "set[str]":
+    """The breakdowns the user typed ("across schemes", "each district", "block-wise") that a
+    model rewrite of the follow-up left out; empty when it kept them all. The breakdown is the
+    question: "Compare the number of applications across schemes for FY 2024-25" came back "How
+    many total applications are recorded under CM Elevate Legacy for FY 2024-25?" and was
+    answered with one total (CM Elevate Legacy sheet TC-25, 2026-11-19, KI-692). "per / every
+    <dim>" is not counted on the user's side: it may be one value ("average per district")."""
+    return _c02_breakdowns(question, include_per=False) - _c02_breakdowns(rewritten)
 
 
 _C01_DRIFT_FILLER = frozenset("WHAT WHICH IS WAS ARE WERE THE A AN OF IN FOR UNDER DURING TOTAL SCHEME FY "

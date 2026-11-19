@@ -220,6 +220,51 @@ async def _focus_legacy_list_total(sql: str, rows: list[dict]) -> "tuple[int, st
     return int(n), subject
 
 
+# Focus Legacy re-test 2026-11-19 (KI-694): "Show me all remittances made between April
+# and June 2025" said "5,106 results match in total" and listed the first 1,000, but never
+# the amount (₹9,54,40,000) — the officer cannot add up 5,106 rows. For a list cut off by
+# its LIMIT, the money columns are summed over the WHOLE result (the query without its
+# LIMIT, through run_readonly) and written beside the true count. Money only: a sum of a
+# per-group size or a window count would be a figure nobody asked for.
+async def _focus_legacy_list_sums(sql: str, rows: list[dict]) -> str:
+    """'₹9,54,40,000 amount disbursed' (comma-joined) for a truncated list, else ''."""
+    if not rows:
+        return ""
+    # Which columns are money: the name as the UI will show it — _c13_money_units adds the
+    # unit the database's catalogue records for the source column ("amount_disbursed" ->
+    # "amount_disbursed_rs"); a name that already carries its unit is kept as it is.
+    probe = {"schemes": ["Focus Legacy"], "data": [dict(rows[0])], "sql": sql}
+    try:
+        _c13_money_units(probe)
+    except Exception:  # noqa: BLE001
+        logger.warning("Focus Legacy list sums: unit lookup failed", exc_info=True)
+    shown = list(probe["data"][0].keys())
+    cols = []                                    # (SQL column, money unit, label)
+    for i, (k, v) in enumerate(rows[0].items()):
+        k = str(k)
+        if _as_number(v) is None or _NONSTAT_COL.search(k) or _c12_is_code_col(k) or not _c12s_additive(k):
+            continue
+        added = str(shown[i])[len(k) + 1:] if str(shown[i]) != k else ""   # the catalogue's unit
+        unit = {"rs": "rupees", "lakh": "lakh", "crore": "crore"}.get(added) or _c12_money_unit(k)
+        if unit:
+            cols.append((k, unit, (_unit_suffix(k) or (k.replace("_", " "),))[0]))
+    if not cols:
+        return ""
+    try:
+        inner = sql_ast.set_limit(sql, None)
+        sums = ", ".join(f'SUM(q."{c.replace(chr(34), chr(34) * 2)}") AS s{i}' for i, (c, _u, _l) in enumerate(cols))
+        got = (await run_readonly(f"SELECT {sums} FROM ({inner}) q") or [{}])[0]
+    except Exception:  # noqa: BLE001 — the totals are extra: never lose the answer over them
+        logger.warning("Focus Legacy list sums query failed — no totals", exc_info=True)
+        return ""
+    parts = []
+    for i, (_c, unit, label) in enumerate(cols):
+        v = _as_number(got.get(f"s{i}"))
+        if v is not None:
+            parts.append(f"{_c12_money(v, unit)} {label}")
+    return ", ".join(parts)
+
+
 # FOCUS sheet TC-12 (testers 2026-09-29, re-run 2026-10-12): the numbers were right but the
 # answer did not say how many payments the repeat-paid groups account for ("user will not
 # subtract"), and the figures came from model SQL. One fixed query, one fixed answer.
@@ -1141,6 +1186,28 @@ async def _focus_legacy_pg_name_answer(question: str, scope: "auth.UserScope | N
     return {"route": "data", "intent": "DATA", "confidence": "high", "schemes": ["Focus Legacy"],
             "resolved_entities": {}, "sql": sql, "sql_query": sql, "row_count": len(rows),
             "rows": ranked[:20], "data": ranked, "answer": answer}
+
+
+# Focus Legacy sheet re-test 2026-11-19 (KI-693): "How many members are there in Balmora
+# Piggery?" names a real group (PG-FOCUS-SGH-12260, 10 members), but its sector word made
+# it a bare CM Elevate question, and the CM Elevate dataset pause ("CM Elevate or CM Elevate
+# Legacy?") fired before the group-name rerouting in _data_scheme_stage could run — the chip
+# answered 1,353 (the Legacy piggery scheme). The words alone cannot tell "members in
+# Balmora Piggery" from "members in piggery" (both parse as a group name), so the DATA
+# decides: the group answer is used only when a group is named exactly that, and the typed
+# name has a word that is not itself CM Elevate vocabulary. Otherwise None (the pause stays).
+async def _focus_legacy_exact_group_answer(question: str, scope: "auth.UserScope | None" = None) -> "dict | None":
+    parsed = _pg_name_question(question)
+    if parsed is None or _mentions_scheme(question):
+        return None
+    toks = _pg_name_tokens(parsed[1])
+    if not toks or not [t for t in toks if _infer_scheme_from_terms(t) != ["CM Elevate"]]:
+        return None
+    answer = await _focus_legacy_pg_name_answer(question, scope)
+    if not answer or not any(_pg_name_tokens(r.get("pg_name")) == toks for r in answer.get("data") or []):
+        return None
+    logger.info("group named exactly %r exists -> Focus Legacy, no CM Elevate dataset pause", parsed[1])
+    return answer
 
 
 # ════ clarifications ══════════════════════════════════════════════════════════════════════════════════

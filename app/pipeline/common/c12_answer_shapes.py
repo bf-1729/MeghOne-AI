@@ -152,6 +152,20 @@ def _c12s_rollup_split(sql: str, rows: list) -> "tuple[list, list]":
     return (detail, totals) if detail and totals else (rows, [])
 
 
+def _c12s_asked_metric(question: str, metrics: list):
+    """The measure a trend leads with: the first column, unless it shares no word with the
+    question and exactly one other column is named by it best (2+ shared words). "What was
+    the total disbursement in each financial year?" over records / sanctioned_cr / subsidy_cr
+    / loan_cr / total_disbursed_cr led with records and never stated the total disbursed
+    (CM Elevate Legacy sheet TC-24, 2026-11-19, KI-687)."""
+    if not metrics or _c12s_e9_asked(str(metrics[0]), question):
+        return metrics[0] if metrics else ""
+    scored = [(_c12s_e9_asked(str(c), question), c) for c in metrics[1:]]
+    best = max((s for s, _c in scored), default=0)
+    top = [c for s, c in scored if s == best]
+    return top[0] if best >= 2 and len(top) == 1 else metrics[0]
+
+
 def _answer_shape(question: str, sql: str, rows: list) -> "_AnswerShape | None":
     """What kind of answer these rows make, or None (the old one-shape prompt).
     Read deterministically: the SQL tree for ORDER BY / LIMIT, the rows for the
@@ -192,7 +206,9 @@ def _answer_shape(question: str, sql: str, rows: list) -> "_AnswerShape | None":
     if order and not time_dims and not compare_asked and (limit or _C12S_RANK_WORDS.search(q)):
         return _AnswerShape("ranking", order[0], metrics, varying, desc=order[1], limit=limit, yes_no=yes_no)
     if time_dims and len(rows) >= 3:
-        return _AnswerShape("trend", metrics[0], metrics, varying, yes_no=yes_no)
+        lead = _c12s_asked_metric(q, metrics)
+        metrics = [lead] + [c for c in metrics if c != lead]
+        return _AnswerShape("trend", lead, metrics, varying, yes_no=yes_no)
     if len(rows) == 2 or compare_asked:
         return _AnswerShape("compare", metrics[0], metrics, varying, yes_no=yes_no)
     return _AnswerShape("breakdown", metrics[0], metrics, varying, yes_no=yes_no)
@@ -234,6 +250,21 @@ def _c12s_pct(part: float, whole: float) -> "float | None":
 
 def _c12s_vals(rows: list, col: str) -> list:
     return [(r, _as_number(r.get(col))) for r in rows if _as_number(r.get(col)) is not None]
+
+
+def _c12s_time_order(pairs: list, tcol: "str | None") -> "tuple[list, list]":
+    """(dated periods in time order, rows whose period is not a date). A COALESCE bucket such as
+    '(no financial year)' — CM Elevate Legacy's 395 Sericulture records — is not a period: read as
+    the first one it gave "Records fell from 395 in (no financial year) to 137 in FY 2025-26"
+    (Legacy sheet TC-23 / TC-24, 2026-11-19, KI-688). Only split when some periods are dated, so a
+    trend over month names keeps its old order."""
+    if not tcol:
+        return list(pairs), []
+    has_digit = [any(ch.isdigit() for ch in str(p[0].get(tcol) or "")) for p in pairs]
+    if not any(has_digit):
+        return sorted(pairs, key=lambda p: str(p[0].get(tcol))), []
+    dated = [p for p, d in zip(pairs, has_digit) if d]
+    return sorted(dated, key=lambda p: str(p[0].get(tcol))), [p for p, d in zip(pairs, has_digit) if not d]
 
 
 def _breakdown_preview(rows: list, shape: _AnswerShape) -> list:
@@ -318,11 +349,9 @@ def _shape_facts(shape: "_AnswerShape | None", rows: list) -> "tuple[str, set[st
     elif shape.kind == "trend":
         tcol = next((c for c in shape.labels if _c12s_is_time_col(c)), shape.labels[0] if shape.labels else None)
         for col in shape.metrics[:2]:
-            cp = _c12s_vals(rows, col)
+            cp, _undated = _c12s_time_order(_c12s_vals(rows, col), tcol)
             if len(cp) < 2:
                 continue
-            if tcol:
-                cp = sorted(cp, key=lambda p: str(p[0].get(tcol)))
             (r0, v0), (r1, v1) = cp[0], cp[-1]
             lab = _metric_label(str(col))
             change = _c12s_num(v1 - v0)
@@ -457,11 +486,9 @@ def _c12s_fix_trend_direction(answer: str, shape: "_AnswerShape | None", rows: l
     if not answer or shape is None or shape.kind != "trend" or not shape.metrics:
         return answer
     tcol = next((c for c in shape.labels if _c12s_is_time_col(c)), shape.labels[0] if shape.labels else None)
-    cp = _c12s_vals(rows, shape.metrics[0])
+    cp, _undated = _c12s_time_order(_c12s_vals(rows, shape.metric or shape.metrics[0]), tcol)
     if len(cp) < 2:
         return answer
-    if tcol:
-        cp = sorted(cp, key=lambda p: str(p[0].get(tcol)))
     change = cp[-1][1] - cp[0][1]
     wrong, right = (_C12S_UP_VERBS, "fell from") if change < 0 else \
         (_C12S_DOWN_VERBS, "rose from") if change > 0 else ((), "")
@@ -531,7 +558,9 @@ def _shaped_fallback(shape: "_AnswerShape | None", rows: list, schemes: "list[st
         return head + ("\n" + "\n".join(others) if others else "")
     if shape.kind == "trend":
         tcol = next((c for c in shape.labels if _c12s_is_time_col(c)), shape.labels[0] if shape.labels else None)
-        cp = sorted(pairs, key=lambda p: str(p[0].get(tcol))) if tcol else pairs
+        cp, undated = _c12s_time_order(pairs, tcol)
+        if len(cp) < 2:
+            return None
         (r0, v0), (r1, v1) = cp[0], cp[-1]
         pct = _c12s_pct(v1 - v0, v0) if v0 else None
         pct_text = f", {'+' if pct > 0 else ''}{pct}%" if pct is not None else ""
@@ -541,8 +570,8 @@ def _shaped_fallback(shape: "_AnswerShape | None", rows: list, schemes: "list[st
                 f"{_fmt_num(_c12s_num(v1))} in {_c12s_label(r1, shape)} ({'+' if change > 0 else ''}"
                 f"{_fmt_num(change)}{pct_text}; {scope}). It peaked at {_fmt_num(_c12s_num(hi_v))} in "
                 f"{_c12s_label(hi_r, shape)}.")
-        if len(cp) <= _C12S_LIST_MAX:
-            lines = [f"- {_c12s_label(r, shape)}: {_fmt_num(_c12s_num(v))}" for r, v in cp]
+        if len(cp) + len(undated) <= _C12S_LIST_MAX:
+            lines = [f"- {_c12s_label(r, shape)}: {_fmt_num(_c12s_num(v))}" for r, v in cp + undated]
         return head + ("\n" + "\n".join(lines) if lines else "")
     # breakdown
     ordered = sorted(pairs, key=lambda p: p[1], reverse=True)
@@ -710,26 +739,29 @@ def _c12s_e9_body(shape: "_AnswerShape | None", rows: list, question: str,
         return "\n".join(lines)
     if shape.kind == "trend":
         tcol = next((c for c in shape.labels if _c12s_is_time_col(c)), shape.labels[0] if shape.labels else None)
-        cp = sorted(pairs, key=lambda p: str(p[0].get(tcol))) if tcol else pairs
-        (r0, v0), (r1, v1) = cp[0], cp[-1]
-        p0, p1 = _c12s_e9_period(r0, shape), _c12s_e9_period(r1, shape)
-        if v1 == v0:
-            lines.append(f"{_c12s_e9_cap(what)} was {_c12_fmt_value(m, v0)} in both {p0} and {p1}.")
-        else:
-            up = v1 > v0
-            pct = _c12s_pct(abs(v1 - v0), abs(v0)) if v0 and not _c12_is_pct_col(m) else None
-            lines.append(f"{_c12s_e9_cap(what)} {'rose' if up else 'fell'} from {_c12_fmt_value(m, v0)} in {p0} to "
-                         f"{_c12_fmt_value(m, v1)} in {p1}, {'up' if up else 'down'} {_c12s_e9_gap(m, abs(v1 - v0))}"
-                         f"{f' ({pct}%)' if pct is not None else ''}.")
-        if _C12S_E9_PEAK_ASK.search(q):
-            hi_r, hi_v = max(cp, key=lambda p: p[1])
-            lo_r, lo_v = min(cp, key=lambda p: p[1])
-            lines.append(f"The highest was {_c12_fmt_value(m, hi_v)} in {_c12s_e9_period(hi_r, shape)}; the lowest "
-                         f"was {_c12_fmt_value(m, lo_v)} in {_c12s_e9_period(lo_r, shape)}.")
-        if len(cp) <= _C12S_LIST_MAX:
-            lines += [f"- {_c12s_e9_period(r, shape)}: {_c12_fmt_value(m, v)}{_c12s_e9_extras(shape, r, 2)}"
-                      for r, v in cp]
-        return "\n".join(lines)
+        cp, undated = _c12s_time_order(pairs, tcol)
+        if len(cp) >= 2:
+            (r0, v0), (r1, v1) = cp[0], cp[-1]
+            p0, p1 = _c12s_e9_period(r0, shape), _c12s_e9_period(r1, shape)
+            if v1 == v0:
+                lines.append(f"{_c12s_e9_cap(what)} was {_c12_fmt_value(m, v0)} in both {p0} and {p1}.")
+            else:
+                up = v1 > v0
+                pct = _c12s_pct(abs(v1 - v0), abs(v0)) if v0 and not _c12_is_pct_col(m) else None
+                lines.append(f"{_c12s_e9_cap(what)} {'rose' if up else 'fell'} from {_c12_fmt_value(m, v0)} in {p0} "
+                             f"to {_c12_fmt_value(m, v1)} in {p1}, {'up' if up else 'down'} "
+                             f"{_c12s_e9_gap(m, abs(v1 - v0))}{f' ({pct}%)' if pct is not None else ''}.")
+            if _C12S_E9_PEAK_ASK.search(q):
+                hi_r, hi_v = max(cp, key=lambda p: p[1])
+                lo_r, lo_v = min(cp, key=lambda p: p[1])
+                lines.append(f"The highest was {_c12_fmt_value(m, hi_v)} in {_c12s_e9_period(hi_r, shape)}; the "
+                             f"lowest was {_c12_fmt_value(m, lo_v)} in {_c12s_e9_period(lo_r, shape)}.")
+        if len(cp) + len(undated) <= _C12S_LIST_MAX:
+            # the measures the question names come first among the extras (KI-687: "total
+            # disbursement in each financial year" showed sanctioned and subsidy, never the total)
+            lines += [f"- {_c12s_e9_period(r, shape)}: {_c12_fmt_value(m, v)}{_c12s_e9_extras(shape, r, 2, question=q)}"
+                      for r, v in cp + undated]
+        return "\n".join(lines) if lines else None
     # breakdown: largest first
     ordered = sorted(pairs, key=lambda p: p[1], reverse=True)
     (hi_r, hi_v), (lo_r, lo_v) = ordered[0], ordered[-1]

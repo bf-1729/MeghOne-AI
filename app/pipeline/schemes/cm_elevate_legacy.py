@@ -375,6 +375,51 @@ async def _cm_legacy_exact_totals(sql: str, rows: list[dict]) -> list[str]:
             f"exactly these figures."]
 
 
+async def _cm_legacy_unrounded_rows(sql: str, rows: list[dict]) -> "list[dict] | None":
+    """`rows` with every `ROUND(SUM(x) / 1e7, 2) AS <name>_cr` value replaced by its unrounded
+    figure, re-queried from the same SQL with only those ROUNDs taken off; None when there is
+    nothing to unround or the rows do not line up one to one (same labels and counts).
+
+    Code writes the figures of a list answer (E9) from the rows, and 2-decimal crore rows
+    gave "₹82.89 crore … in total" (the sum of 13 rounded rows) against a true ₹82.90 crore,
+    and "₹0" for Sericulture (spinning)'s ₹26,000 (Legacy sheet TC-18 / TC-27, 2026-11-19,
+    KI-689 / KI-690). The table keeps the rounded rows; only the answer text uses these."""
+    if len(rows or []) < 2:
+        return None
+    tree = sql_ast.parse_one(sql or "")
+    if not isinstance(tree, exp.Select):
+        return None
+    sums = _cml_cr_sums(tree)
+    if not sums:
+        return None
+    new = tree.copy()
+    names = {e.alias.lower() for e in sums}
+    for e in sql_ast.outer_select(new).expressions:
+        if isinstance(e, exp.Alias) and e.alias.lower() in names and isinstance(e.this, exp.Round):
+            e.set("this", e.this.this)
+    try:
+        got = await run_readonly(sql_ast.to_sql(new))
+    except Exception:  # noqa: BLE001 — the rounded rows still answer
+        logger.warning("CM Legacy unrounded re-query failed — rounded rows kept", exc_info=True)
+        return None
+    got = [dict(r) for r in got or []]
+    if len(got) != len(rows):
+        return None
+
+    def key(r: dict) -> tuple:
+        return tuple((k, str(v)) for k, v in r.items() if str(k).lower() not in names)
+    exact = {key(r): r for r in got}
+    if len(exact) != len(got):
+        return None
+    out = []
+    for r in rows:
+        g = exact.get(key(r))
+        if g is None:
+            return None
+        out.append({k: (g.get(k) if str(k).lower() in names else v) for k, v in r.items()})
+    return out
+
+
 # ── CM Elevate Legacy answer guarantees (use-case re-test 2026-09-29, KI-167) ─
 # TC-34 "applications mapped to each village in Tikrikilla block": the SQL and
 # table were right (42 villages, 89 records) but the composer wrote "20 villages
@@ -882,7 +927,7 @@ async def _cm_legacy_answer_guarantees(question: str, sql: str, rows: list[dict]
     if _none:
         logger.info("CM Elevate Legacy: empty result — no-records sentence (KI-383)")
         return _none
-    if len(rows or []) == 1 and _is_fallback_answer(answer, rows, ["CM Elevate Legacy"], display):
+    if len(rows or []) == 1 and _is_fallback_answer(answer, rows, ["CM Elevate Legacy"], display, sql=sql):
         answer = _cml_single_row_sentence(rows[0], display) or answer
     answer = _cml_complete_list(question, answer, rows)
     answer = _cml_village_breakdown(answer, rows, display)
@@ -1013,11 +1058,58 @@ def _cm_legacy_keep_unresolved_off_village(question: str, schemes: list[str], sq
         return sql
     if sql_ast.references_column(sql, "village_code", "lgd_village_name") \
             or _VILLAGE_WORD_MATCH.search(question or ""):
-        return sql
+        return _unresolved_into_village_aggregates(sql)
     out = sql_ast.remove_conditions(sql, _cml_is_unresolved_neq)
     if out != sql:
         logger.info("%s: dropped entity_type <> 'Unresolved' from a non-village query — "
                     "the no-village records still count at district grain", schemes[0])
+    return out
+
+
+_CML_VILLAGE_COLS = frozenset({"village_code", "lgd_village_name"})
+
+
+# Focus Legacy re-test 2026-11-19 (KI-697): "Show me all remittances made between April and June
+# 2025" was answered as ONE row of totals that also counted villages — SUM(amount_disbursed),
+# COUNT(*), ..., COUNT(DISTINCT village_code) ... WHERE ... AND entity_type <> 'Unresolved' — so
+# the village filter cut every total too: 4,828 payments / ₹9,11,85,000 against a true 5,106 /
+# ₹9,54,40,000 (278 no-village payments dropped). The guard above stood aside because the SQL
+# names village_code. The prompt's own form (schema_context: "villages" -> COUNT(DISTINCT
+# village_code) FILTER (WHERE entity_type <> 'Unresolved')) is applied: the condition moves from
+# WHERE onto the village aggregates. Only for one plain SELECT whose village columns all sit
+# inside aggregates, beside at least one other aggregate; a village list / GROUP BY village or a
+# pure village count is returned unchanged.
+def _unresolved_into_village_aggregates(sql: str) -> str:
+    tree = _cml_simple_select(sql)
+    if tree is None or tree.args.get("where") is None:
+        return sql
+    cols = [c for c in tree.find_all(exp.Column) if c.name.lower() in _CML_VILLAGE_COLS]
+    if not cols or any(c.find_ancestor(exp.AggFunc) is None for c in cols):
+        return sql
+    aggs = [a for e in tree.expressions for a in e.find_all(exp.AggFunc)]
+    village = [a for a in aggs if any(c.name.lower() in _CML_VILLAGE_COLS for c in a.find_all(exp.Column))]
+    if not village or len(village) == len(aggs) or any(isinstance(a.parent, exp.Filter) for a in village):
+        return sql
+
+    def fn(t):
+        where = t.args.get("where")
+        conds = list(where.this.flatten()) if isinstance(where.this, exp.And) else [where.this]
+        moved = [c for c in conds if _cml_is_unresolved_neq(c)]
+        keep = [c for c in conds if not _cml_is_unresolved_neq(c)]
+        if not moved:
+            return None
+        if keep:
+            where.set("this", exp.and_(*[c.copy() for c in keep]))
+        else:
+            where.pop()
+        for a in [a for e in t.expressions for a in e.find_all(exp.AggFunc)
+                  if any(c.name.lower() in _CML_VILLAGE_COLS for c in a.find_all(exp.Column))]:
+            a.replace(exp.Filter(this=a.copy(), expression=exp.Where(this=moved[0].copy())))
+        return None
+    out = sql_ast.transform(sql, fn)
+    if out != sql:
+        logger.info("Unresolved filter moved from WHERE onto the village aggregate(s) — the other "
+                    "totals keep the no-village records")
     return out
 
 
