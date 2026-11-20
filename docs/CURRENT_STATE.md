@@ -5,6 +5,41 @@
 **Branch / commit:** `main` @ `f38ea1b` (2026-10-02 session start). Uncommitted at session start: `docs/HANDOFF.md`, `docs/KNOWN_ISSUES.md` (KI-182) and untracked QA files; the LangGraph session added the changes listed below on top, all uncommitted.
 
 **Port: 8401 only, everywhere (user rule 2026-10-19). Start from the repo venv.**
+## Latest: Focus Legacy sheet fixes (2026-11-19, KI-686, KI-693..697). Code changed, uncommitted; LIVE-VERIFIED in-process. :8401 NOT restarted.
+- All 28 use cases re-run live: **27 passed, 1 with observation, 0 failed** (TC-28 Nongstoin wording, KI-696 rest). Every figure =
+  megh_db = raw file. Report `docs/Focus_Legacy_UseCase_Test_Report_2026-11-19_after_fixes.xlsx`. Full pytest 5,460 passed, 1 pre-existing
+  failure (BLH8), 1 pre-existing collection error; scripts 14/14. Details: HANDOFF, KNOWN_ISSUES KI-686 / KI-693..697.
+
+## Latest: Focus Legacy use-case sheet vs megh_db AND the raw file (2026-11-19, KI-693..696, KI-686 also hit). No app code changed.
+- 28 use cases of `Use_Cases_-_Focus.csv` (31 questions) run live in-process. **20 passed, 5 passed with observation, 3 failed**; every
+  headline figure equals the DB except TC-14 Q1 ("Balmora Piggery" -> CM Elevate Legacy 1,353; right: 10, KI-693). TC-19 / TC-20 fail on
+  the list Key points (KI-686, KI-694). VERIFIED: raw file = DB at every level (only PG names differ for 1,634 multi-name groups).
+  Report: `docs/Focus_Legacy_UseCase_Test_Report_2026-11-19.xlsx`, PNG proofs `docs/reports/fl_proofs_2026-11-19/`.
+
+## Latest: CM Elevate Legacy sheet defects fixed (2026-11-19, KI-687..692). Code changed, uncommitted; LIVE-VERIFIED in-process. :8401 NOT restarted.
+- Re-run of all 36 use cases after the fixes: **36 / 36 passed** (was 30 / 36). Report `docs/CM_Elevate_Legacy_UseCase_Test_Report_2026-11-19_after_fixes.xlsx`,
+  proofs `docs/reports/cml_proofs_2026-11-19_after_fixes/`. Fixes: trend measure + undated bucket (c12 shapes), small ROUNDed crore
+  (c12 `_c12_money`), Legacy unrounded rows for code-written lines (`_cm_legacy_unrounded_rows`, `compose_response(exact_rows=)`,
+  graph key `exact_rows`), rewrite may not drop a typed breakdown (c01 `_c01_dropped_breakdown`). Tests: NEW
+  `tests/test_cml_sheet_fixes_2026_11_19.py` (14); full pytest 5,444 passed / 1 failed (pre-existing BLH8); scripts 14/14;
+  live context suite 106/107 (scenario F T5, D-099 expectation — fails on the original code too).
+
+## Earlier the same day: CM Elevate Legacy use-case sheet vs megh_db AND the raw export (2026-11-19, KI-687..692). No app code changed.
+- `Use_Cases_-_CM_Elevate.xlsx` (tab "CM Elevate Legacy", TC-01..36) live in-process: **30 / 36 passed** (knowledge 10/10, data 20/26).
+  Failed: TC-18 (₹0 for ₹26,000; total 82.89, KI-689/690), TC-22 (₹7,00,000 for ₹6,66,000, KI-691), TC-23 (trend from the
+  no-year bucket, KI-688), TC-24 (sanctioned + subsidy instead of total disbursement, KI-687), TC-25 (no per-scheme split, KI-692),
+  TC-27 (total 82.89, KI-689). Raw `Cm Elevate to share to BLH.xlsx` (2,823 rows) = megh_db on every grouping tested.
+  Report: `docs/CM_Elevate_Legacy_UseCase_Test_Report_2026-11-19.xlsx`, PNG proofs `docs/reports/cml_proofs_2026-11-19/`.
+
+## Latest: CM Elevate sheet re-test vs megh_db AND the raw export (2026-11-19, KI-683..686). No app code changed.
+- CM-ELEVATE-OFF-001..030 (33 questions, live in-process, current rules: valid-only default, status = file_status,
+  pending = Valid + Pending/Send Back): **26 / 30 passed** (29 / 33 questions). Failed: OFF-011 (each sector: "(row)"
+  labels, Piggery missing, KI-683), OFF-018 (level 2 dropped from the sentence, KI-684), OFF-025 (no programme / sector
+  breakdown, KI-685), OFF-027 (Key points "across 4 districts", KI-686). OFF-030 (failed 4 Nov) now passes.
+- Raw `CM_Elevate_AllSchemes_20260818_122217.xlsx` = 8,400 applications; megh_db today 8,990 (+590), so raw figures
+  are usually lower; the raw file has no `file_status`. Report: `docs/CM_Elevate_UseCase_Test_Report_2026-11-19.xlsx`
+  (Summary, Test Case Results, Question Results, Proofs), PNG proofs in `docs/reports/cme_proofs_2026-11-19/`.
+
 ## Latest: overall Focus Plus summary — wrong "~3%" cohort share, glued scope sentence (2026-11-05, KI-682). Code changed, uncommitted; LIVE-VERIFIED in-process. :8401 NOT restarted.
 - "~3% of beneficiaries" was hard-coded (it is 3% of payment records); now computed from the query: 12,527 of 1,05,813
   beneficiaries, ~11.8%. The answer ends with its own scope line, so c12 `_finish_answer` no longer glues one to the last bullet.

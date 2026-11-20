@@ -30,12 +30,24 @@ def _money_rounded_for_display(rows: list[dict]) -> list[dict]:
     return out
 
 
+def _c13_raw_column_named(answer: str, rows: list[dict]) -> bool:
+    """Whether `answer` writes a result column's raw name — one with an underscore
+    ("producer_groups"), as a whole word — instead of saying what it counts (KI-696)."""
+    words_in = set((answer or "").replace("`", " ").split())
+    names = {str(k) for r in (rows or [])[:1] for k in r if "_" in str(k)}
+    return any(w.strip(".,;:()*\"'") in names for w in words_in)
+
+
 async def compose_response(question: str, sql: str, rows: list[dict],
                            notes: list[str] | None = None,
                            entities: dict[str, str] | None = None,
                            schemes: list[str] | None = None,
                            style_examples: str = "",
-                           extra_numbers: "set[str] | None" = None) -> str:
+                           extra_numbers: "set[str] | None" = None,
+                           exact_rows: "list[dict] | None" = None) -> str:
+    # exact_rows: `rows` with their rounded money values unrounded (CM Elevate Legacy,
+    # _cm_legacy_unrounded_rows), one to one. Only the lines code writes (E9) read them, so a
+    # total is not a sum of rounded rows and ₹26,000 is not "₹0" (KI-689 / KI-690).
     # extra_numbers: figures a caller re-queried and handed over in a note (a
     # list's true total), which the answer may quote although no row holds
     # them. None for every caller that doesn't pass it — unchanged behaviour.
@@ -148,6 +160,11 @@ async def compose_response(question: str, sql: str, rows: list[dict],
     # ("ALL DISTRICTS" read as a 13th district, Legacy sheet TC-36, KI-384).
     _shape_rows, _total_rows = _c12s_rollup_split(sql, rows)
     shape = _answer_shape(question, sql, _shape_rows)
+    _text_rows = _shape_rows
+    if exact_rows and len(exact_rows) == len(rows):
+        _ex_rows, _ex_totals = _c12s_rollup_split(sql, exact_rows)
+        if len(_ex_rows) == len(_shape_rows) and len(_ex_totals) == len(_total_rows):
+            _text_rows = _ex_rows
     if shape is not None and shape.kind == "breakdown":
         # a split has no order of its own: the composer listed it in the query's order
         # although told "largest first" (live 2026-10-22). The table keeps `rows` as is.
@@ -179,7 +196,7 @@ async def compose_response(question: str, sql: str, rows: list[dict],
     # split misquoted twice on the composer path, same check).
     _premise_notes = [n for n in (notes or []) if str(n).startswith('The question treats "')]
     if settings.ANSWER_TEMPLATES_ENABLED and not (_premise_notes or extra_numbers or no_usable_value or _total_rows):
-        _body = _c12s_e9_body(shape, _shape_rows, question)
+        _body = _c12s_e9_body(shape, _text_rows, question)
         if _body:
             logger.info("compose_response: templated %s answer (metric %s)", shape.kind, shape.metric)
             _frame = await _c12s_e9_framing(question, shape, _shape_rows, sql, schemes, entities,
@@ -272,7 +289,11 @@ Answer:"""
                "left out one of the result values")
         logger.warning("compose_response: answer %s (%r) — strict retry", why, answer[:160])
         if len(preview) == 1:
-            allowed = "; ".join(f"{k} = {v}" for k, v in preview[0].items())
+            # readable labels, never the raw column names: given "producer_groups = 268" the
+            # retry wrote "The result shows 268 for the producer_groups metric" (Focus Legacy
+            # re-test 2026-11-19, TC-28, KI-696)
+            allowed = "; ".join(f"{_human_metric(str(k)) if _as_number(v) is not None else str(k).replace('_', ' ')}"
+                                f" = {v}" for k, v in preview[0].items())
         else:
             allowed = ", ".join(sorted(data_nums, key=len, reverse=True))
         strict_prompt = (
@@ -289,11 +310,13 @@ Answer:"""
             # the Focus Plus one-figure rule above, re-applied to the retry
             schemes in _ONE_FIGURE_SCHEMES and len(preview) == 1 and len(_row_metrics(preview[0])) == 1
             and _row_metrics(preview[0])[0][1] not in (0, None)
-            and not _answer_covers_metrics(answer, preview[0]))
+            and not _answer_covers_metrics(answer, preview[0])) or (
+            # the retry echoed a raw result column name ("producer_groups"): not a briefing line
+            _c13_raw_column_named(answer, preview))
         if still_bad:
             logger.warning("compose_response: retry still wrong — using deterministic answer")
             # in the question's shape when it has one (a ranked list, a comparison …)
-            answer = (_shaped_fallback(shape, _shape_rows, schemes, entities, question)
+            answer = (_shaped_fallback(shape, _text_rows, schemes, entities, question)
                       or _framed_fallback(rows if len(rows) > 1 else preview, schemes, entities, sql=sql))
 
     # Deterministic safety net for the opposite failure: the query DID return a
@@ -306,7 +329,7 @@ Answer:"""
         if metrics_now and all(v not in (0, None) for _k, v in metrics_now):
             logger.warning("compose_response: hedged over a real value %r — deterministic answer",
                            answer[:160])
-            answer = _framed_fallback(preview, schemes, entities)
+            answer = _framed_fallback(preview, schemes, entities, sql=sql)
         elif _is_plain_list_result(rows):
             logger.warning("compose_response: hedged over a %d-row list result %r — "
                            "deterministic list answer", len(rows), answer[:160])
@@ -322,7 +345,7 @@ Answer:"""
             # chart/table built from the same rows showed real data.
             logger.warning("compose_response: hedged over a %d-row breakdown %r — "
                            "deterministic answer", len(preview), answer[:160])
-            answer = _shaped_fallback(shape, _shape_rows, schemes, entities, question) or _framed_fallback(rows, schemes, entities, sql=sql)
+            answer = _shaped_fallback(shape, _text_rows, schemes, entities, question) or _framed_fallback(rows, schemes, entities, sql=sql)
     # A list answer must state the list's true size: "Ten villages in the
     # Dadenggre constituency received employment" for 135 villages, and the
     # fallback's "Here are the 40 results" for 114 (it was handed only the
@@ -335,7 +358,7 @@ Answer:"""
                              for n in {len(rows), len(_shape_rows)} | _per_scheme_sizes):
         logger.warning("compose_response: answer states a list size other than %d — deterministic answer",
                        len(rows))
-        answer = _shaped_fallback(shape, _shape_rows, schemes, entities, question) or _framed_fallback(rows, schemes, entities, sql=sql)
+        answer = _shaped_fallback(shape, _text_rows, schemes, entities, question) or _framed_fallback(rows, schemes, entities, sql=sql)
     answer = _c12s_fix_trend_direction(answer, shape, _shape_rows)   # KI-441
     answer = _cme_level_pending_wording(question, schemes, answer)  # KI-422
     answer = _fp_cohort_zero_answer(question, schemes, rows, answer)  # KI-365
@@ -1006,7 +1029,7 @@ def _new_data_turn(question: str, *, skip_scope_clarify: bool = False,
             "schemes": None, "fp_amount": None, "entity_result": None,
             "mg_admin": None, "mg_women": None, "mg_det": None, "per_scheme": None,
             "sql": None, "rows": None, "notes": None, "style": "",
-            "fl_total": None, "fl_unplaced": None, "fl_breakdown": None, "answer": None,
+            "fl_total": None, "fl_unplaced": None, "fl_breakdown": None, "exact_rows": None, "answer": None,
             "cross": None, "pre_rephrase_question": None}
 
 
@@ -1175,6 +1198,12 @@ async def _data_scheme_stage(d: dict, scope: "auth.UserScope | None" = None) -> 
     # from the applications data unasked (Legacy sheet re-run 2026-10-22).
     _cme_pause = _cm_elevate_dataset_pause(d.get("pre_rephrase_question") or question)
     if _cme_pause is not None:
+        # a Focus Legacy group whose name holds a CM Elevate sector word ("Balmora
+        # Piggery", KI-693) is answered as that group, never asked about CM Elevate
+        _pg_answer = await _focus_legacy_exact_group_answer(question, scope)
+        if _pg_answer is not None:
+            _denial = _repaired_sql_denial(scope, ["Focus Legacy"], {"resolved": {}}, None)
+            return _denied(_denial, ["Focus Legacy"], {}) if _denial else _pg_answer
         raise _cme_pause
 
     # A village NAME that contains another scheme's vocabulary is not a scheme
@@ -2639,6 +2668,8 @@ async def _data_post_rows_stage(d: dict, scope: "auth.UserScope | None" = None) 
         notes.extend(_cm_legacy_small_money_notes(rows))
         notes.extend(await _cm_legacy_exact_totals(sql, rows))
         _style = _cm_legacy_style_block(question)
+        # the unrounded _cr figures, for the lines code writes (KI-689 / KI-690)
+        d["exact_rows"] = await _cm_legacy_unrounded_rows(sql, rows)
     _fl_total = _fl_unplaced = None
     if schemes == ["Focus Legacy"]:
         notes.extend(_focus_legacy_answer_notes(question))
@@ -2679,7 +2710,7 @@ async def _data_compose_stage(d: dict, scope: "auth.UserScope | None" = None) ->
         d["rows"] = rows
     answer = _fl_breakdown or await compose_response(question, sql, rows, notes=notes,
                                     entities=await _entities_with_sql_year(sql, entity_result.get("display")),
-                                    schemes=schemes, style_examples=_style,
+                                    schemes=schemes, style_examples=_style, exact_rows=d.get("exact_rows"),
                                     extra_numbers=({str(_fl_total[0])} if _fl_total else set()) | {
                                         str(int(n)) for v in (_fl_unplaced[1] if _fl_unplaced else {}).values()
                                         for n in [_as_number(v)] if n is not None} or None)
@@ -3140,12 +3171,17 @@ async def _data_guarantees_stage(d: dict, scope: "auth.UserScope | None" = None)
         answer = _focus_legacy_answer_guarantees(answer, sql, rows)
         if _fl_unplaced and not _fl_breakdown:
             answer = _focus_legacy_unplaced_guarantee(answer, *_fl_unplaced)
+    # the money of the WHOLE truncated list, not of the rows shown (KI-694)
+    _fl_sums = await _focus_legacy_list_sums(sql, rows) if _fl_total else ""
     if _fl_total and not (_c1x_bounded_find(f"{_fl_total[0]:,}", answer.split("\n", 1)[0])
                           or _c1x_bounded_find(f"{_fl_total[0]}", answer.split("\n", 1)[0])):
         # Deterministic guarantee: the composer (or its row-by-row fallback)
         # did not lead with the true count, so the list would read as complete.
-        answer = (f"{_fl_total[0]:,} {_fl_total[1]} match in total; the top {len(rows)} are "
+        _with = f" ({_fl_sums} in all)" if _fl_sums else ""
+        answer = (f"{_fl_total[0]:,} {_fl_total[1]} match in total{_with}; the top {len(rows)} are "
                   f"shown below.\n\n{answer}")
+    elif _fl_total and _fl_sums and _fl_sums.split(" ", 1)[0] not in answer:
+        answer = f"All {_fl_total[0]:,} {_fl_total[1]} together: {_fl_sums}.\n\n{answer}"
     answer = await _latest_year_guarantee(answer, sql)
     # Year-gap guarantee: the question named a year the scheme does not hold and
     # _apply_year_gap answered for another. The note says so, but the composer

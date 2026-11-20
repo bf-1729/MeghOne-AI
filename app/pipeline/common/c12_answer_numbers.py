@@ -327,7 +327,8 @@ def _c12_money(v: "int | float", unit: str = "rupees") -> str:
     crore)", "₹9,40,000 (≈ ₹9.40 lakh)", "₹35,000". No ".00" on a whole amount; paise
     only when present. A lakh column stays in lakh with its crore size: "₹25,701.49
     lakh (≈ ₹257.01 crore)". A crore column (the SQL already divided) has no exact
-    rupees to show: "₹3,628.67 crore". A true zero is '₹0'."""
+    rupees to show: "₹3,628.67 crore", and a small rounded one stays in crore: "₹0.07
+    crore" (KI-691). A true zero is '₹0'."""
     rupees = float(v) * _C12_MONEY_SCALE[unit]
     sign, a = ("-" if rupees < 0 else ""), abs(rupees)
     if unit == "crore" and a >= 1e6:
@@ -335,6 +336,13 @@ def _c12_money(v: "int | float", unit: str = "rupees") -> str:
     if unit == "lakh" and a >= 1e4:
         lakh = f"{sign}₹{_c12_indian(a / 1e5, 2)} lakh"
         return lakh + (f" (≈ {sign}₹{_c12_indian(a / 1e7, 2)} crore)" if a >= 1e7 else "")
+    # A small crore value with at most 2 decimals is a ROUND(…, 2) figure, not an exact
+    # amount: 0.07 crore came out "₹7,00,000 (≈ ₹7.00 lakh)" for a true ₹6,66,000 (CM Elevate
+    # Legacy sheet TC-22, 2026-11-19, KI-691). It stays in its own unit; an unrounded value
+    # (0.0666 crore) still gets the exact rupees below. Crore only: a lakh column is MGNREGA's own
+    # stored unit, where 0.05 lakh is exactly ₹5,000 (test_one_money_formatter).
+    if unit == "crore" and a and abs(float(v) * 100 - round(float(v) * 100)) < 1e-6:
+        return f"{sign}₹{_c12_indian(abs(float(v)), 2)} {unit}"
     exact = round(a, 2)
     out = f"{sign}₹{_c12_indian(exact, 0 if float(exact).is_integer() else 2)}"
     if a >= 1e7:
@@ -572,7 +580,22 @@ def _c12_key_points(rows: list[dict]) -> list[str]:
 
     tuples = [tuple(v for _k, v in p[0]) for p in parts]
     unique = len(set(tuples)) == len(rows)
-    item, items = (noun(keys[-1], False), noun(keys[-1])) if unique else ("row", "rows")
+    # The item a row IS: the last label column (district > block > village lists). When that
+    # column repeats but another one names every row once, the rows are that column's items
+    # and the last column is their attribute: "Which Producer Groups received more than
+    # ₹1,00,000?" (pg_name, lgd_district) said "across 25 districts ... Every district has 2"
+    # for 25 groups in 10 districts (Focus Legacy re-test 2026-11-19, KI-686).
+    # No column names every row once (programme x district, CM Elevate OFF-027 "1,828 in
+    # total, across 4 districts" for 2 districts): the items are plain rows (KI-686).
+    ik = len(keys) - 1
+    if unique and len({t[ik] for t in tuples}) < len(rows):
+        ik = next((i for i in range(len(keys) - 2, -1, -1)
+                   if len({t[i] for t in tuples}) == len(rows)), None)
+    if ik is None:
+        item, items, others = "row", "rows", list(range(len(keys)))
+    else:
+        item, items = (noun(keys[ik], False), noun(keys[ik])) if unique else ("row", "rows")
+        others = [i for i in range(len(keys)) if i != ik] if ik != len(keys) - 1 else list(range(len(keys) - 1))
     additive = _c12s_additive(str(m)) and all(v >= 0 for v in vals)
     points: list[str] = []
     if additive:
@@ -580,7 +603,8 @@ def _c12_key_points(rows: list[dict]) -> list[str]:
     else:
         points.append(f"{len(rows)} {items} in the result.")
     spread, single = [], None
-    for i, k in enumerate(keys[:-1]):
+    for i in others:
+        k = keys[i]
         seen = list(dict.fromkeys(t[i] for t in tuples))
         if len(seen) == 1 and single is None:
             single = seen[0]
@@ -590,7 +614,7 @@ def _c12_key_points(rows: list[dict]) -> list[str]:
         points.append(f"All in {single}.")
     if spread:
         points.append("Spread over " + " and ".join(spread) + ".")
-    outer = next((i for i, k in enumerate(keys[:-1]) if len({t[i] for t in tuples}) > 1), None)
+    outer = next((i for i in others if len({t[i] for t in tuples}) > 1), None)
     if additive and outer is not None:
         sums: dict = {}
         counts: dict = {}
@@ -722,6 +746,24 @@ def _scope_words(schemes: "list[str] | None", entities: "dict | None") -> tuple[
     return scheme, place, period
 
 
+def _c12_extreme_value_col(sql: "str | None", col: str) -> bool:
+    """Whether the outer SELECT computes output column `col` as MAX(...) or MIN(...)."""
+    if not sql:
+        return False
+    try:
+        from app import sql_ast as _ast
+        from sqlglot import exp as _exp
+        tree = _ast.parse_one(sql)
+        sel = tree if isinstance(tree, _exp.Select) else (tree.find(_exp.Select) if tree else None)
+        for e in (sel.expressions if sel is not None else []):
+            if e.alias_or_name.lower() == col.lower():
+                node = e.this if isinstance(e, _exp.Alias) else e
+                return isinstance(node, (_exp.Max, _exp.Min))
+    except Exception:                        # noqa: BLE001 — wording only: never fail the answer
+        return False
+    return False
+
+
 def _framed_fallback(rows: list[dict], schemes: "list[str] | None", entities: "dict | None",
                      sql: "str | None" = None) -> str:
     """The deterministic answer as a briefing sentence: scheme, figure, what it
@@ -758,7 +800,16 @@ def _framed_fallback(rows: list[dict], schemes: "list[str] | None", entities: "d
                 caveats.append(_METRIC_CAVEAT[str(k).lower()])
         if not parts:
             return _deterministic_answer(rows)
-        if len(parts) == 1:
+        # A figure the SQL takes as a MAX / MIN is a value, not a total — "for
+        # PG-FOCUS-WKH-3565, Nongprat Lynti, ... the recorded total is 190 group size"
+        # for MAX(no_of_pg_members) AS group_size (Focus Legacy re-test 2026-11-19,
+        # KI-696). Read on the SQL tree; a SUM / COUNT keeps "the recorded total is"
+        # (a village's "18 women provided employment"). Plain singular measures only.
+        _hm = _human_metric(str(nums[0][0])) if len(nums) == 1 else ""
+        if len(parts) == 1 and _hm and _c12_extreme_value_col(sql, str(nums[0][0])) \
+                and not _unit_suffix(str(nums[0][0])) and not _hm.split()[-1].endswith("s"):
+            body = f"the {_hm} is {_fmt_num(nums[0][1])}"
+        elif len(parts) == 1:
             body = f"the recorded total is {parts[0]}"
         else:
             body = "the records show " + ", ".join(parts[:-1]) + f" and {parts[-1]}"
@@ -777,14 +828,27 @@ def _framed_fallback(rows: list[dict], schemes: "list[str] | None", entities: "d
         except Exception:                    # the highlights are extra: never lose the answer over them
             logger.warning("framed fallback: key points skipped", exc_info=True)
     if points:
-        return head + "\n**Key points**\n" + "\n".join(points) + "\n**Details**" + lines
+        # A list cut off by its own LIMIT: the points read only the rows shown, and
+        # must say so — "All in 2025-06-18" for 5,106 remittances on three dates came
+        # from the first 1,000 rows (Focus Legacy re-test 2026-11-19, KI-694).
+        title = "**Key points**"
+        try:
+            from app import sql_ast as _ast
+            _lim = _ast.outer_limit(sql or "")
+        except Exception:                    # noqa: BLE001 — a heading word is never worth a failure
+            _lim = None
+        if _lim and len(rows) >= _lim:
+            title = f"**Key points (the {len(rows):,} rows shown)**"
+        return head + "\n" + title + "\n" + "\n".join(points) + "\n**Details**" + lines
     return head + lines
 
 
-def _is_fallback_answer(answer: str, rows: list[dict], schemes: "list[str] | None", entities: "dict | None") -> bool:
+def _is_fallback_answer(answer: str, rows: list[dict], schemes: "list[str] | None", entities: "dict | None",
+                        sql: "str | None" = None) -> bool:
     """Was `answer` written by the deterministic fallback (bare or framed)?"""
     a = (answer or "").strip()
-    return a in (_deterministic_answer(rows).strip(), _framed_fallback(rows, schemes, entities).strip())
+    return a in (_deterministic_answer(rows).strip(), _framed_fallback(rows, schemes, entities).strip(),
+                 _framed_fallback(rows, schemes, entities, sql=sql).strip() if sql else None)
 
 
 from app.text_match import number_spans as _c12_number_spans  # noqa: E402 — the framing pass below

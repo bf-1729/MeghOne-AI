@@ -161,15 +161,34 @@ def _is_whole_refusal(text: str) -> bool:
 # leading heading line whenever it's phrased as a question (ends in "?");
 # non-FAQ section headings (e.g. "### Eligibility Criteria") don't match and
 # are left as useful context.
+def _rag_list_number_prefix(line: str) -> bool:
+    """True for a line opening with an FAQ entry number: digits, an optional letter,
+    then '.' and a space or tab ("4. What ...", "8a. How ...")."""
+    i = 0
+    while i < len(line) and line[i].isdigit():
+        i += 1
+    if i == 0:
+        return False
+    if i < len(line) and line[i].isalpha():
+        i += 1
+    return line[i:i + 1] == "." and line[i + 1:i + 2] in (" ", "\t")
+
+
+# Focus Legacy sheet re-test 2026-11-19 (KI-695): megh_knowledge (loaded by another
+# pipeline, D-074) stores an FAQ entry as "4. What is a Producer Group (PG)?\n<answer>"
+# (the '#' gone, the entry number kept), so the heading survived and "4." reached the
+# answer as "From the scheme FAQ: 4.". A numbered question line is dropped the same way.
 def _rag_drop_question_heading(text: str) -> str:
     """Drop a first line "#..# Question?" (one to six '#', then spaces/tabs, a
-    line ending in '?' plus optional spaces/tabs) and the newlines after it."""
+    line ending in '?' plus optional spaces/tabs) or "N. Question?" (an FAQ entry
+    number, see _rag_list_number_prefix) and the newlines after it."""
     nl = text.find("\n")
     if nl < 0:
         return text
     line = text[:nl]
     h = len(line) - len(line.lstrip("#"))
-    if not 1 <= h <= 6 or line[h:h + 1] not in (" ", "\t") or not line.rstrip(" \t").endswith("?"):
+    hashed = 1 <= h <= 6 and line[h:h + 1] in (" ", "\t")
+    if not (hashed or _rag_list_number_prefix(line)) or not line.rstrip(" \t").endswith("?"):
         return text
     end = nl
     while end < len(text) and text[end] == "\n":
@@ -1147,6 +1166,9 @@ def _with_faq_facts(answer: str, chunks: list[dict]) -> str:
     have = _rag_unit_numbers(answer)
     adds = []
     for sentence in split_sentences(_strip_heading(chunks[0].get("text") or "")):
+        # a list marker ("4.") or the entry's own question is not a fact (KI-695)
+        if len(words(sentence)) < 3 or sentence.rstrip().endswith("?"):
+            continue
         nums = _rag_unit_numbers(sentence)
         if nums and not nums <= have and len(adds) < 2:
             adds.append(sentence.strip())

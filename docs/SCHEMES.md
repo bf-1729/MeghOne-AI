@@ -301,6 +301,8 @@ Notes on the table:
   `test_pg_name_lookup.py`, `test_pg_abbreviation.py`, `test_lookup_intent.py`,
   `test_ac_focus_legacy.py`, `test_ac_flow_focus_legacy.py`, `test_year_gap_*.py`,
   `test_stale_clarification.py`, `test_focus_legacy_sheet_run_2026_10_22.py`.
+- **QA (2026-11-19, after fixes):** same sheet re-run live after KI-686 / KI-693..697: 27 passed, 1 with observation (TC-28 wording), 0 failed. Report `docs/Focus_Legacy_UseCase_Test_Report_2026-11-19_after_fixes.xlsx`.
+- **QA (2026-11-19):** `Use_Cases_-_Focus.csv` (28 use cases, 31 questions) vs `megh_db` and raw `Focus Legacy to share to BLH.xlsx` (raw = DB at every level): 20 passed, 5 with observation, 3 failed (TC-14 KI-693, TC-19 KI-686, TC-20 KI-694). Report `docs/Focus_Legacy_UseCase_Test_Report_2026-11-19.xlsx`.
 - **QA (2026-10-22):** `raw_uc/Use_Cases_-_Focus.csv` (28 use cases) vs raw `raw_uc/Focus Legacy to share to BLH.csv`
   (raw = DB: 14,569 rows, every field and every level). Before the fixes 25/28 use cases (TC-28 constituency 12/55,
   TC-16 / TC-25 with "FOCUS PG"); after: sweep 231/231, sheet wording 84/84, constituencies 55/55. Report
