@@ -235,6 +235,24 @@ curl -s 127.0.0.1:8411/health
 `docker compose down` here only stops this project, because of the `name:` key.
 Run it from `/opt/meghalaya-langgraph`, never from the old directory.
 
+**Docker build fails: `address family not supported by protocol` (2026-11-18).**
+`failed to resolve source metadata for docker.io/... dial tcp [2600:...]:443: socket:
+address family not supported by protocol` means Docker resolved Docker Hub to an
+**IPv6** address and the host has no IPv6 route. It is a host network problem, not
+an app bug. The `# syntax=docker/dockerfile:1` line (now removed from the
+Dockerfile) was the first thing to hit it; the base image `python:3.11-slim` is
+pulled the same way, so on a host where it is not already cached, also fix the host:
+
+1. Check: `docker pull python:3.11-slim`. If it fails the same way, continue.
+2. Make the host prefer IPv4: add `precedence ::ffff:0:0/96  100` to
+   `/etc/gai.conf`, then `sudo systemctl restart docker`.
+3. If it still fails, disable IPv6 for the host's DNS answers (e.g.
+   `sysctl -w net.ipv6.conf.all.disable_ipv6=1`, persisted in
+   `/etc/sysctl.d/`), or pull through a registry mirror the box can reach
+   (`"registry-mirrors"` in `/etc/docker/daemon.json`).
+4. With no internet at all: `docker save python:3.11-slim` on a machine that has
+   it, copy the tar, `docker load -i` on the box, then `docker compose build`.
+
 ### Switching over / rolling back
 
 Switch: point the DNS name (or the old vhost's `proxy_pass`) at `8410` / `8411`.
