@@ -182,13 +182,13 @@ own directory and the two run in parallel; you switch over only when ready.
 |---|---|---|
 | Directory | `/opt/meghalaya` | **`/opt/meghalaya-langgraph`** |
 | systemd unit | `megh-nlpservice.service` | **`megh-langgraph.service`** |
-| App port (bare metal) | 8300 | **8410** |
+| App port (bare metal) | 8300 | **8401** (was 8410 until 2026-11-19) |
 | nginx vhost file | `nginx-nlpservice.conf` | **`nginx-megh-langgraph.conf`** |
 | nginx rate-limit zones | `api_rl`, `login_rl`, `conn_per_ip` | **`*_lg`** (must be unique per file) |
 | compose project | default (`meghalaya`) | **`meg-6schemes`** (`name:` in compose; renamed from `megh-langgraph` 2026-11-18 — Docker requires lowercase) |
 | Image | `megh-nlp:latest` | **`meg-6schemes:latest`** |
 | Containers | `megh-nlp`, `megh-qdrant`, `megh-redis` | **`Meg-6Schemes-nlp`, `-qdrant`, `-redis`** |
-| Container port / host port | 8300 / 8401 | **8400 / 8411** |
+| Container port / host port | 8300 / 8401 | **8401 / 127.0.0.1:8401** (was 8400 / 8411) |
 | Local Qdrant / Redis host ports | 6333 / 6379 | **6343 / 6389** |
 | Named volumes | `meghalaya_hf_cache`, `meghalaya_qdrant_data` | **`meg-6schemes_hf_cache`, `meg-6schemes_qdrant_data`** |
 
@@ -208,12 +208,12 @@ sudo mkdir -p /opt/meghalaya-langgraph && sudo chown ubuntu:ubuntu /opt/meghalay
 cd /opt/meghalaya-langgraph
 python3.11 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 cp /opt/meghalaya/.env .env     # start from the live config, then edit
-# .env MUST differ: PORT=8410, and any path/port the old one owns.
+# .env MUST differ: PORT=8401, and any path/port the old one owns.
 
 sudo cp deploy/systemd/megh-langgraph.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now megh-langgraph
 systemctl status megh-langgraph --no-pager      # old service must still be active
-curl -s localhost:8410/health                   # new
+curl -s localhost:8401/health                   # new
 curl -s localhost:8300/health                   # old, unchanged
 
 sudo cp deploy/nginx/nginx-megh-langgraph.conf /etc/nginx/sites-available/megh-langgraph
@@ -229,7 +229,7 @@ sudo nginx -t && sudo systemctl reload nginx
 cd /opt/meghalaya-langgraph
 docker compose build && docker compose up -d
 docker ps --format '{{.Names}}	{{.Ports}}'    # old megh-nlp must still be listed
-curl -s 127.0.0.1:8411/health
+curl -s 127.0.0.1:8401/health
 ```
 
 `docker compose down` here only stops this project, because of the `name:` key.
@@ -255,7 +255,9 @@ pulled the same way, so on a host where it is not already cached, also fix the h
 
 ### Switching over / rolling back
 
-Switch: point the DNS name (or the old vhost's `proxy_pass`) at `8410` / `8411`.
+Switch: point the DNS name (or the old vhost's `proxy_pass`) at `8401`.
+The nginx template and the systemd unit both use 8401 (2026-11-19: the template
+used to say 8410 while compose published 8401, so logins never reached the app).
 Roll back: point it back. Both stacks keep running, so a rollback needs no
 rebuild. Retire the old one only after the new build has run cleanly.
 

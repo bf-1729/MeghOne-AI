@@ -1250,8 +1250,8 @@ programme word never taken as the village.
   against the real app + middleware with the turn stubbed **17/17**. NOT yet run against the live gateway (needs the VPN).
 
 ## Side-by-side deploy identifiers (2026-10-04)
-- This build deploys to `/opt/meghalaya-langgraph` as `megh-langgraph.service` (port 8410) or compose project
-  `megh-langgraph` (host 8411). The existing deploy (`/opt/meghalaya`, `megh-nlpservice.service`, port 8300,
+- This build deploys to `/opt/meghalaya-langgraph` as `megh-langgraph.service` (port 8401; was 8410 until 2026-11-19) or compose project
+  `meg-6schemes` (host 127.0.0.1:8401). The nginx template proxies to 8401 (it said 8410 until 2026-11-19, so logins never reached the container). The existing deploy (`/opt/meghalaya`, `megh-nlpservice.service`, port 8300,
   containers `megh-nlp`/`megh-qdrant`/`megh-redis`) is untouched and keeps running. Table: deploy/DEPLOYMENT.md.
 - Fixed in passing: the Dockerfile served 8300 while compose mapped 8400. VERIFIED (`docker compose config`).
 
